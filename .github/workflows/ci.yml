@@ -71,6 +71,8 @@ jobs:
       # ── Integration test ─────────────────────────────────────────────────────
       - name: Create kind cluster
         uses: helm/kind-action@v1
+        with:
+          cluster_name: kind
 
       - name: Wait for CoreDNS to be ready
         run: |
