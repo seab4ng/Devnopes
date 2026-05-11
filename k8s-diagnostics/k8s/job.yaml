@@ -1,0 +1,99 @@
+---
+# ──────────────────────────────────────────────────────────────────────────────
+# k8s-diagnostics Job
+#
+# Mandatory env vars:
+#   TARGET_NAMESPACE   — namespace where your Helm release is deployed
+#
+# Optional env vars:
+#   TARGET_SERVICE     — service name to deep-test (DNS vs ClusterIP vs pod IP)
+#   TARGET_PORT        — port to TCP-connect on for the service deep-test (default: 80)
+#   CLUSTER_DOMAIN     — cluster DNS domain (default: cluster.local)
+#   DNS_SLOW_THRESHOLD — seconds above which DNS is flagged as slow (default: 0.5)
+#   DNS_TIMEOUT        — hard timeout for each DNS query (default: 3.0)
+#   CONNECT_TIMEOUT    — hard timeout for TCP connect probes (default: 3.0)
+#
+# Usage:
+#   # 1. Apply RBAC once:
+#   kubectl apply -f rbac.yaml
+#
+#   # 2. Edit TARGET_NAMESPACE (and optionally TARGET_SERVICE) below, then:
+#   kubectl apply -f job.yaml
+#
+#   # 3. Watch results:
+#   kubectl logs -n kube-system -l job-name=k8s-diagnostics -f
+#
+#   # 4. Re-run: delete the job and apply again
+#   kubectl delete job k8s-diagnostics -n kube-system && kubectl apply -f job.yaml
+# ──────────────────────────────────────────────────────────────────────────────
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: k8s-diagnostics
+  namespace: kube-system
+  labels:
+    app: k8s-diagnostics
+spec:
+  ttlSecondsAfterFinished: 3600   # auto-clean after 1 hour; remove line if not supported
+  backoffLimit: 0                 # do not retry on failure — one clear run is enough
+  template:
+    metadata:
+      labels:
+        app: k8s-diagnostics
+    spec:
+      serviceAccountName: k8s-diagnostics
+      restartPolicy: Never
+
+      # Run on a control-plane node if possible so we can reach kube-system easily;
+      # remove the tolerations block if your cluster restricts this.
+      tolerations:
+        - key: node-role.kubernetes.io/control-plane
+          operator: Exists
+          effect: NoSchedule
+        - key: node-role.kubernetes.io/master
+          operator: Exists
+          effect: NoSchedule
+
+      containers:
+        - name: diagnostics
+          # Replace with your internal registry path in airgap environments, e.g.:
+          #   registry.internal.corp/tools/k8s-diagnostics:latest
+          image: ghcr.io/seab4ng/devnopes/k8s-diagnostics:latest
+          imagePullPolicy: IfNotPresent
+
+          env:
+            # ── REQUIRED ──────────────────────────────────────────────────────
+            - name: TARGET_NAMESPACE
+              value: "default"         # ← change to your Helm release namespace
+
+            # ── OPTIONAL: uncomment + set to run the service deep-test ────────
+            # - name: TARGET_SERVICE
+            #   value: "my-app"        # ← your service name (no namespace, no domain)
+            # - name: TARGET_PORT
+            #   value: "8080"
+
+            # ── OPTIONAL: tuning ──────────────────────────────────────────────
+            # - name: CLUSTER_DOMAIN
+            #   value: "cluster.local"
+            # - name: DNS_SLOW_THRESHOLD
+            #   value: "0.5"
+            # - name: DNS_TIMEOUT
+            #   value: "3.0"
+            # - name: CONNECT_TIMEOUT
+            #   value: "3.0"
+
+          resources:
+            requests:
+              cpu: "50m"
+              memory: "64Mi"
+            limits:
+              cpu: "200m"
+              memory: "128Mi"
+
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            runAsNonRoot: true
+            runAsUser: 1000
+            capabilities:
+              drop: ["ALL"]

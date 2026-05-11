@@ -1,0 +1,46 @@
+---
+# ServiceAccount the Job will run as
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: k8s-diagnostics
+  namespace: kube-system   # run from kube-system so it can read everything cleanly
+
+---
+# Read-only access to cluster-wide resources (nodes, pods, services, etc.)
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: k8s-diagnostics
+rules:
+  - apiGroups: [""]
+    resources:
+      - nodes
+      - pods
+      - services
+      - endpoints
+      - events
+      - namespaces
+      - resourcequotas
+    verbs: ["get", "list"]
+  - apiGroups: ["apps"]
+    resources:
+      - deployments
+      - daemonsets
+      - replicasets
+      - statefulsets
+    verbs: ["get", "list"]
+
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: k8s-diagnostics
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: k8s-diagnostics
+subjects:
+  - kind: ServiceAccount
+    name: k8s-diagnostics
+    namespace: kube-system
