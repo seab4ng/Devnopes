@@ -246,15 +246,11 @@ def check_cluster_dns():
 
 # ─── Check 3: CoreDNS pod health + log scan ───────────────────────────────────
 #
-# Log patterns: ONLY errors that indicate CoreDNS is failing at its DNS function.
-# - [ERROR]       CoreDNS structured error (plugin failure, query processing error)
-# - SERVFAIL      Actively returning SERVFAIL to DNS clients right now
-# - i/o timeout   Cannot reach upstream DNS forwarder
-# - no route to host  Network path to upstream DNS is broken
-# - connection refused  Upstream DNS port closed / firewall blocking
-#
-# What we do NOT flag: info/debug lines, [WARNING], cache messages, reload notices,
-# or any line that does not match these exact patterns.
+# Log patterns matched here are reported as WARNINGS (not IT_ISSUES) because
+# CoreDNS logs [ERROR]/SERVFAIL/i/o timeout for upstream forwarding failures
+# (e.g. external nameservers unreachable in restricted/CI networks). These are
+# NOT cluster-internal DNS failures. The authoritative DNS health test is
+# check_cluster_dns() above which directly probes cluster FQDNs.
 
 _COREDNS_LOG_PATTERNS = [
     (re.compile(r'\[ERROR\]',          re.IGNORECASE), "CoreDNS [ERROR] in recent logs"),
@@ -298,18 +294,20 @@ def check_coredns(k8s):
         if phase == "Running" and ready:
             log(f"OK    {name}  node={node}  Running/Ready  (restarts={restarts})", "OK")
 
-            # Pod is up — but scan recent logs for DNS-function errors.
-            # A pod can be Ready yet actively failing at its job.
+            # Pod is up — scan recent logs for DNS-function patterns.
+            # Matches go to WARNINGS (not IT_ISSUES): upstream forwarding errors
+            # are common in restricted networks and do not mean cluster DNS is broken.
             container_name = cs_list[0].name if cs_list else "coredns"
             hits = _scan_logs_for_patterns(k8s, "kube-system", name, container_name,
                                            _COREDNS_LOG_PATTERNS)
             if hits:
                 for meaning, example in hits:
-                    log(f"FAIL  {name}  log error: {meaning}", "FAIL")
+                    log(f"WARN  {name}  log pattern: {meaning}", "WARN")
                     log(f"      example: {example[:120]}", "INFO")
-                    IT_ISSUES.append(
-                        f"CoreDNS pod '{name}' is Running/Ready but has recent log errors "
-                        f"({meaning}) — pod is up but DNS is failing internally. "
+                    WARNINGS.append(
+                        f"CoreDNS pod '{name}' has recent log patterns "
+                        f"({meaning}) — may indicate upstream DNS forwarding issues "
+                        f"(not a cluster-internal DNS failure if FQDN resolution above passed). "
                         f"Example: {example[:120]}"
                     )
             else:
