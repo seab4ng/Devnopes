@@ -1,19 +1,19 @@
 apiVersion: batch/v1
 kind: Job
 metadata:
-  name: {{ include "k8s-diagnostics.name" . }}
+  name: {{ include "devnopes.name" . }}
   namespace: {{ .Values.job.namespace }}
   labels:
-    {{- include "k8s-diagnostics.labels" . | nindent 4 }}
+    {{- include "devnopes.labels" . | nindent 4 }}
 spec:
   ttlSecondsAfterFinished: {{ .Values.job.ttlSecondsAfterFinished }}
   backoffLimit: 0
   template:
     metadata:
       labels:
-        {{- include "k8s-diagnostics.labels" . | nindent 8 }}
+        {{- include "devnopes.labels" . | nindent 8 }}
     spec:
-      serviceAccountName: {{ include "k8s-diagnostics.name" . }}
+      serviceAccountName: {{ include "devnopes.name" . }}
       restartPolicy: Never
 
       {{- with .Values.job.tolerations }}

@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-k8s-diagnostics: Cluster Infrastructure Health Checker
+devnopes: Cluster Infrastructure Health Checker
 Checks ONLY cluster-level components — not application workloads.
 
 Verdict:
@@ -952,7 +952,7 @@ def print_verdict():
 # ─── Main ─────────────────────────────────────────────────────────────────────
 def main():
     print("╔══════════════════════════════════════════════════════════════╗")
-    print("║       k8s-diagnostics — Cluster Infrastructure Checker      ║")
+    print("║       devnopes — Cluster Infrastructure Checker      ║")
     print("║  Checks cluster components only. No app workloads touched.  ║")
     print("╚══════════════════════════════════════════════════════════════╝")
     print(f"\n  cluster domain    : {CLUSTER_DOMAIN}")

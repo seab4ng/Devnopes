@@ -1,4 +1,4 @@
-# k8s-diagnostics
+# devnopes
 
 A Kubernetes Job that checks **cluster infrastructure only** and returns a clear verdict:
 
@@ -39,21 +39,21 @@ The image is built in CI (which has internet) and pushed to Docker Hub. In airga
 
 ```bash
 # On a machine with internet access:
-docker pull your-dockerhub-username/k8s-diagnostics:latest
-docker tag  your-dockerhub-username/k8s-diagnostics:latest \
-            registry.internal.corp/tools/k8s-diagnostics:latest
-docker push registry.internal.corp/tools/k8s-diagnostics:latest
+docker pull your-dockerhub-username/devnopes:latest
+docker tag  your-dockerhub-username/devnopes:latest \
+            registry.internal.corp/tools/devnopes:latest
+docker push registry.internal.corp/tools/devnopes:latest
 ```
 
 ### Step 2 — Update the image reference
 
 **Helm** — set in `values.yaml` or with `--set`:
 ```bash
-helm install k8s-diagnostics ./k8s-diagnostics/helm \
-  --set image.repository=registry.internal.corp/tools/k8s-diagnostics
+helm install devnopes ./helm \
+  --set image.repository=registry.internal.corp/tools/devnopes
 ```
 
-**kubectl** — edit the `image:` field in `k8s-diagnostics/k8s/job.yaml` before applying.
+**kubectl** — edit the `image:` field in `k8s/job.yaml` before applying.
 
 ---
 
@@ -61,20 +61,20 @@ helm install k8s-diagnostics ./k8s-diagnostics/helm \
 
 ```bash
 # 1. Apply RBAC (once per cluster)
-kubectl apply -f k8s-diagnostics/k8s/rbac.yaml
+kubectl apply -f k8s/rbac.yaml
 
 # 2. Run the job
-kubectl apply -f k8s-diagnostics/k8s/job.yaml
+kubectl apply -f k8s/job.yaml
 
 # 3. Watch the verdict
-kubectl logs -n kube-system -l job-name=k8s-diagnostics -f
+kubectl logs -n kube-system -l job-name=devnopes -f
 
 # 4. Re-run (delete the completed job and apply again)
-kubectl delete job k8s-diagnostics -n kube-system
-kubectl apply  -f k8s-diagnostics/k8s/job.yaml
+kubectl delete job devnopes -n kube-system
+kubectl apply  -f k8s/job.yaml
 ```
 
-To enable the service network path test, uncomment `TARGET_SERVICE` in `job.yaml`.
+To enable the service network path test, uncomment `TARGET_SERVICE` in `k8s/job.yaml`.
 
 ---
 
@@ -82,25 +82,25 @@ To enable the service network path test, uncomment `TARGET_SERVICE` in `job.yaml
 
 ```bash
 # Install (basic — infrastructure checks only)
-helm install k8s-diagnostics ./k8s-diagnostics/helm \
+helm install devnopes ./helm \
   -n kube-system \
-  --set image.repository=registry.internal.corp/tools/k8s-diagnostics
+  --set image.repository=registry.internal.corp/tools/devnopes
 
 # Install with service network path test enabled
-helm install k8s-diagnostics ./k8s-diagnostics/helm \
+helm install devnopes ./helm \
   -n kube-system \
-  --set image.repository=registry.internal.corp/tools/k8s-diagnostics \
+  --set image.repository=registry.internal.corp/tools/devnopes \
   --set networkPathTest.enabled=true \
   --set networkPathTest.service=my-app \
   --set networkPathTest.namespace=production \
   --set networkPathTest.port=8080
 
 # Re-run (delete Job and upgrade to recreate it)
-kubectl delete job k8s-diagnostics -n kube-system
-helm upgrade k8s-diagnostics ./k8s-diagnostics/helm -n kube-system
+kubectl delete job devnopes -n kube-system
+helm upgrade devnopes ./helm -n kube-system
 
 # Uninstall
-helm uninstall k8s-diagnostics -n kube-system
+helm uninstall devnopes -n kube-system
 ```
 
 ---
@@ -149,7 +149,7 @@ The pipeline (`.github/workflows/ci.yml`) does:
 2. Runs `uv lock` — generates/verifies `uv.lock` (the dependency lockfile)
 3. Runs `uv sync --frozen --no-dev` — installs deps in CI for verification
 4. Builds the Docker image (multi-stage; all packages baked in at build time)
-5. Pushes to Docker Hub (on push to `main` or version tags only)
+5. Pushes to Docker Hub **only on version tag** (`v*`) — plain pushes to `main` are build-check only
 
 ### Required GitHub secrets
 
@@ -169,6 +169,13 @@ The image is pushed to `<DOCKERHUB_USERNAME>/devnopes`.
 | Push to `main` | ✓ (build check only) | ✗ |
 | Push of `v1.2.3` tag | ✓ | ✓ — tags `1.2.3`, `1.2`, `1`, `latest` |
 
+### To release a new version
+
+```bash
+git tag v1.0.0
+git push origin v1.0.0
+```
+
 ---
 
 ## Building the image locally
@@ -177,16 +184,16 @@ Requires internet access (downloads base image and packages). The resulting imag
 
 ```bash
 # Generate the lockfile first if you haven't already (see Dependency management below)
-cd k8s-diagnostics
+uv lock
 
 # Build
-docker build -t k8s-diagnostics:local .
+docker build -t devnopes:local .
 
 # Run locally against your current kubeconfig context
 docker run --rm \
   -v ~/.kube/config:/root/.kube/config:ro \
   -e CLUSTER_DOMAIN=cluster.local \
-  k8s-diagnostics:local
+  devnopes:local
 ```
 
 ---
@@ -201,11 +208,8 @@ docker run --rm \
 # Install uv
 curl -LsSf https://astral.sh/uv/install.sh | sh
 
-# Generate uv.lock from pyproject.toml
-cd k8s-diagnostics
+# Generate uv.lock from pyproject.toml and commit it
 uv lock
-
-# Commit the lockfile — CI and Docker both use it
 git add uv.lock
 git commit -m "Add uv lockfile"
 ```
@@ -213,14 +217,14 @@ git commit -m "Add uv lockfile"
 ### Local development
 
 ```bash
-uv sync --no-dev       # install exact locked versions
+uv sync --no-dev           # install exact locked versions
 uv run python diagnose.py  # run with the managed venv
 ```
 
 ### Updating dependencies
 
 ```bash
-uv lock --upgrade      # resolve latest allowed versions
+uv lock --upgrade          # resolve latest allowed versions
 git add uv.lock && git commit -m "Update lockfile"
 ```
 
@@ -234,4 +238,4 @@ The tool identifies the installed CNI using three layers, falling back in order:
 2. **CRDs** — matches installed CRD API groups against known signatures (`projectcalico.org`, `cilium.io`, `antrea.io`, …). No hostPath needed.
 3. **Pod label scan** (fallback) — scans kube-system pods with known label selectors. Least reliable; can miss custom installs.
 
-Disable the hostPath mount (`cniConfMount.enabled: false` in Helm / comment out the volume in `job.yaml`) if your security policy prohibits it — layers 2 and 3 activate automatically.
+Disable the hostPath mount (`cniConfMount.enabled: false` in Helm / comment out the volume in `k8s/job.yaml`) if your security policy prohibits it — layers 2 and 3 activate automatically.

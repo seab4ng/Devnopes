@@ -4,7 +4,10 @@ on:
   push:
     branches: [main]
     paths:
-      - "k8s-diagnostics/**"
+      - "diagnose.py"
+      - "Dockerfile"
+      - "pyproject.toml"
+      - "uv.lock"
       - ".github/workflows/ci.yml"
   tags:
     - "v*"         # e.g. v1.0.0 — triggers a release build and push
@@ -22,9 +25,6 @@ env:
 jobs:
   build-and-push:
     runs-on: ubuntu-latest
-    defaults:
-      run:
-        working-directory: k8s-diagnostics
 
     steps:
       - name: Checkout
@@ -39,7 +39,7 @@ jobs:
         with:
           version: "0.5.4"
           enable-cache: true
-          cache-dependency-glob: "k8s-diagnostics/uv.lock"
+          cache-dependency-glob: "uv.lock"
 
       - name: Generate / verify lockfile
         # uv lock is idempotent: no-op if pyproject.toml hasn't changed.
@@ -78,22 +78,22 @@ jobs:
             type=raw,value=latest,enable=${{ startsWith(github.ref, 'refs/tags/') }}
 
       - name: Build image
-        # Runs on every push to main AND every tag — always builds, never pushes on plain push
+        # Runs on every push to main — build check only, no push
         if: "!startsWith(github.ref, 'refs/tags/')"
         uses: docker/build-push-action@v6
         with:
-          context: k8s-diagnostics
+          context: .
           push: false
           tags: ${{ env.IMAGE_NAME }}:build-check
           cache-from: type=gha
           cache-to: type=gha,mode=max
 
       - name: Build and push release image
-        # Runs only on tag push — this is the only step that pushes to Docker Hub
+        # Runs only on tag push — the only step that pushes to Docker Hub
         if: startsWith(github.ref, 'refs/tags/')
         uses: docker/build-push-action@v6
         with:
-          context: k8s-diagnostics
+          context: .
           push: true
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}

@@ -1,5 +1,5 @@
 apiVersion: v2
-name: k8s-diagnostics
+name: devnopes
 description: >
   Kubernetes cluster infrastructure health checker.
   Runs as a Job and determines whether problems are IT Team (cluster/infra)

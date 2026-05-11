@@ -1,5 +1,5 @@
 [project]
-name = "k8s-diagnostics"
+name = "devnopes"
 version = "0.1.0"
 description = "Kubernetes cluster infrastructure health checker for airgap environments"
 requires-python = ">=3.11"

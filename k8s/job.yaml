@@ -1,6 +1,6 @@
 ---
 # ──────────────────────────────────────────────────────────────────────────────
-# k8s-diagnostics Job
+# devnopes Job
 #
 # Checks CLUSTER INFRASTRUCTURE ONLY. No application workloads are inspected.
 # Verdict is always: "IT TEAM RESPONSIBILITY" or "INFRASTRUCTURE IS HEALTHY".
@@ -25,27 +25,27 @@
 #   kubectl apply -f job.yaml
 #
 #   # 3. Watch the output:
-#   kubectl logs -n kube-system -l job-name=k8s-diagnostics -f
+#   kubectl logs -n kube-system -l job-name=devnopes -f
 #
 #   # 4. Re-run (delete and re-apply):
-#   kubectl delete job k8s-diagnostics -n kube-system && kubectl apply -f job.yaml
+#   kubectl delete job devnopes -n kube-system && kubectl apply -f job.yaml
 # ──────────────────────────────────────────────────────────────────────────────
 apiVersion: batch/v1
 kind: Job
 metadata:
-  name: k8s-diagnostics
+  name: devnopes
   namespace: kube-system
   labels:
-    app: k8s-diagnostics
+    app: devnopes
 spec:
   ttlSecondsAfterFinished: 3600   # auto-clean after 1 hour; remove line if not supported
   backoffLimit: 0                 # do not retry on failure — one clear run is enough
   template:
     metadata:
       labels:
-        app: k8s-diagnostics
+        app: devnopes
     spec:
-      serviceAccountName: k8s-diagnostics
+      serviceAccountName: devnopes
       restartPolicy: Never
 
       # Run on a control-plane node if possible so we can reach kube-system easily;
@@ -71,8 +71,8 @@ spec:
       containers:
         - name: diagnostics
           # Replace with your internal registry path in airgap environments, e.g.:
-          #   registry.internal.corp/tools/k8s-diagnostics:latest
-          image: ghcr.io/seab4ng/devnopes/k8s-diagnostics:latest
+          #   registry.internal.corp/tools/devnopes:latest
+          image: ghcr.io/seab4ng/devnopes/devnopes:latest
           imagePullPolicy: IfNotPresent
 
           volumeMounts:

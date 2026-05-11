@@ -1,8 +1,8 @@
 # ── Image ─────────────────────────────────────────────────────────────────────
 image:
   # In airgap environments, replace with your internal registry:
-  #   repository: registry.internal.corp/tools/k8s-diagnostics
-  repository: your-dockerhub-username/k8s-diagnostics
+  #   repository: registry.internal.corp/tools/devnopes
+  repository: your-dockerhub-username/devnopes
   tag: latest
   pullPolicy: IfNotPresent
 
