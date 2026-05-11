@@ -160,13 +160,14 @@ Go to **Settings → Secrets and variables → Actions → New repository secret
 | `DOCKERHUB_USERNAME` | Your Docker Hub username |
 | `DOCKERHUB_TOKEN` | Docker Hub → Account Settings → Security → New Access Token |
 
+The image is pushed to `<DOCKERHUB_USERNAME>/devnopes`.
+
 ### Image tags produced
 
-| Event | Tags |
-|---|---|
-| Push to `main` | `latest`, `<short-sha>` |
-| Push of `v1.2.3` tag | `1.2.3`, `1.2`, `<short-sha>` |
-| Pull request | Build only — no push |
+| Event | Build | Push |
+|---|---|---|
+| Push to `main` | ✓ (build check only) | ✗ |
+| Push of `v1.2.3` tag | ✓ | ✓ — tags `1.2.3`, `1.2`, `1`, `latest` |
 
 ---
 
