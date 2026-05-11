@@ -1,0 +1,91 @@
+name: CI — Build and Push
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "k8s-diagnostics/**"
+      - ".github/workflows/ci.yml"
+  pull_request:
+    branches: [main]
+    paths:
+      - "k8s-diagnostics/**"
+      - ".github/workflows/ci.yml"
+
+# Required GitHub secrets:
+#   DOCKERHUB_USERNAME  — your Docker Hub username
+#   DOCKERHUB_TOKEN     — Docker Hub access token
+#                         (Docker Hub → Account Settings → Security → New Access Token)
+
+env:
+  IMAGE_NAME: ${{ secrets.DOCKERHUB_USERNAME }}/k8s-diagnostics
+
+jobs:
+  build-and-push:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: k8s-diagnostics
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # ── Python dependency management via uv ──────────────────────────────────
+      # uv is a fast Python package manager (written in Rust).
+      # It generates uv.lock (the lockfile) and installs from it.
+      # This step runs in CI — NOT inside the Docker container at runtime.
+      - name: Install uv
+        uses: astral-sh/setup-uv@v4
+        with:
+          version: "0.5.4"
+          enable-cache: true
+          cache-dependency-glob: "k8s-diagnostics/uv.lock"
+
+      - name: Generate / verify lockfile
+        # uv lock is idempotent: no-op if pyproject.toml hasn't changed.
+        # Generates uv.lock on first run; verifies it on subsequent runs.
+        # The generated uv.lock is available in the workspace for Docker COPY.
+        run: uv lock
+
+      - name: Install dependencies (CI verification)
+        # Installs exactly the versions pinned in uv.lock — no surprises.
+        # This step also serves as a smoke-test that the lockfile is valid.
+        run: uv sync --frozen --no-dev
+
+      # ── Docker ───────────────────────────────────────────────────────────────
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Login to Docker Hub
+        if: github.event_name != 'pull_request'
+        uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Extract image metadata
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.IMAGE_NAME }}
+          tags: |
+            # Tag with the short commit SHA on every push
+            type=sha,prefix=,format=short
+            # Tag as 'latest' only on pushes to main
+            type=raw,value=latest,enable=${{ github.ref == 'refs/heads/main' }}
+            # Tag with semver on version tags (e.g. v1.2.3)
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+
+      - name: Build and push image
+        uses: docker/build-push-action@v6
+        with:
+          context: k8s-diagnostics
+          # Only push on non-PR events (PRs get a build-only check)
+          push: ${{ github.event_name != 'pull_request' }}
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          # GitHub Actions cache — speeds up subsequent builds significantly
+          cache-from: type=gha
+          cache-to: type=gha,mode=max

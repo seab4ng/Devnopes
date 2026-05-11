@@ -1,0 +1,19 @@
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: {{ include "k8s-diagnostics.name" . }}
+  labels:
+    {{- include "k8s-diagnostics.labels" . | nindent 4 }}
+rules:
+  - apiGroups: [""]
+    resources: [nodes, pods, services, endpoints, events, namespaces, resourcequotas]
+    verbs: [get, list]
+  - apiGroups: [""]
+    resources: [pods/log]
+    verbs: [get]
+  - apiGroups: [apps]
+    resources: [deployments, daemonsets, replicasets, statefulsets]
+    verbs: [get, list]
+  - apiGroups: [apiextensions.k8s.io]
+    resources: [customresourcedefinitions]
+    verbs: [get, list]

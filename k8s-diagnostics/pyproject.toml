@@ -1,0 +1,14 @@
+[project]
+name = "k8s-diagnostics"
+version = "0.1.0"
+description = "Kubernetes cluster infrastructure health checker for airgap environments"
+requires-python = ">=3.11"
+dependencies = [
+    "kubernetes>=28.1.0",
+]
+
+[tool.uv]
+# uv is used for dependency management and lockfile generation.
+# Run `uv lock` once after cloning (requires internet) to generate uv.lock,
+# then commit uv.lock. CI and Docker both use the committed lockfile — no
+# internet access is required at runtime or inside the cluster.

@@ -1,0 +1,73 @@
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: {{ include "k8s-diagnostics.name" . }}
+  namespace: {{ .Values.job.namespace }}
+  labels:
+    {{- include "k8s-diagnostics.labels" . | nindent 4 }}
+spec:
+  ttlSecondsAfterFinished: {{ .Values.job.ttlSecondsAfterFinished }}
+  backoffLimit: 0
+  template:
+    metadata:
+      labels:
+        {{- include "k8s-diagnostics.labels" . | nindent 8 }}
+    spec:
+      serviceAccountName: {{ include "k8s-diagnostics.name" . }}
+      restartPolicy: Never
+
+      {{- with .Values.job.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+
+      {{- if .Values.cniConfMount.enabled }}
+      volumes:
+        - name: cni-conf
+          hostPath:
+            path: {{ .Values.cniConfMount.hostPath }}
+            type: DirectoryOrCreate
+      {{- end }}
+
+      containers:
+        - name: diagnostics
+          image: "{{ .Values.image.repository }}:{{ .Values.image.tag }}"
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+
+          {{- if .Values.cniConfMount.enabled }}
+          volumeMounts:
+            - name: cni-conf
+              mountPath: /host/etc/cni/net.d
+              readOnly: true
+          {{- end }}
+
+          env:
+            - name: CLUSTER_DOMAIN
+              value: {{ .Values.config.clusterDomain | quote }}
+            - name: DNS_SLOW_THRESHOLD
+              value: {{ .Values.config.dnsSlowThreshold | quote }}
+            - name: DNS_TIMEOUT
+              value: {{ .Values.config.dnsTimeout | quote }}
+            - name: CONNECT_TIMEOUT
+              value: {{ .Values.config.connectTimeout | quote }}
+            - name: LOG_SCAN_SECONDS
+              value: {{ .Values.config.logScanSeconds | quote }}
+            {{- if .Values.networkPathTest.enabled }}
+            - name: TARGET_SERVICE
+              value: {{ .Values.networkPathTest.service | quote }}
+            - name: TARGET_NAMESPACE
+              value: {{ .Values.networkPathTest.namespace | quote }}
+            - name: TARGET_PORT
+              value: {{ .Values.networkPathTest.port | quote }}
+            {{- end }}
+
+          resources:
+            {{- toYaml .Values.resources | nindent 12 }}
+
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            runAsNonRoot: true
+            runAsUser: 1000
+            capabilities:
+              drop: ["ALL"]
