@@ -71,6 +71,12 @@ jobs:
           cache-to: type=gha,mode=max
 
       # ── Integration test ─────────────────────────────────────────────────────
+      - name: Delete any existing kind cluster
+        # Guarantees a completely fresh cluster every run.
+        # kind-action skips creation if a cluster with the same name already
+        # exists, which causes stale resources to bleed across CI runs.
+        run: kind delete cluster --name kind 2>/dev/null || true
+
       - name: Create kind cluster
         uses: helm/kind-action@v1
         with:
@@ -85,19 +91,8 @@ jobs:
       - name: Load image into kind
         run: kind load docker-image ${{ env.CI_IMAGE }}
 
-      - name: Clean up any previous devnopes release
-        # kind-action reuses an existing cluster when the runner VM is reused,
-        # leaving resources from the previous run that Helm cannot adopt.
-        # Wipe them so helm upgrade --install always starts from a clean state.
-        run: |
-          helm uninstall devnopes -n kube-system 2>/dev/null || true
-          kubectl delete serviceaccount devnopes -n kube-system --ignore-not-found=true
-          kubectl delete clusterrole devnopes --ignore-not-found=true
-          kubectl delete clusterrolebinding devnopes --ignore-not-found=true
-          kubectl delete job devnopes -n kube-system --ignore-not-found=true
-
       - name: Install devnopes via Helm
-        # upgrade --install is idempotent: installs on first run, upgrades on re-runs.
+        # Helm creates the ServiceAccount, ClusterRole, ClusterRoleBinding, and Job.
         # pullPolicy=Never — image was loaded locally above, do not pull from registry.
         # cniConfMount.enabled=false — kind nodes are containers; no real /etc/cni/net.d.
         #   The tool falls back to CRD/pod detection automatically.
