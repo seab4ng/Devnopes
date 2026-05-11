@@ -9,6 +9,8 @@ on:
       - "pyproject.toml"
       - "uv.lock"
       - ".github/workflows/ci.yml"
+      - "helm/**"
+      - "k8s/**"
     tags:
       - "v*"       # e.g. v1.0.0 — triggers a release build and push
 
@@ -83,10 +85,8 @@ jobs:
       - name: Load image into kind
         run: kind load docker-image ${{ env.CI_IMAGE }}
 
-      - name: Apply RBAC
-        run: kubectl apply -f k8s/rbac.yaml
-
       - name: Install devnopes via Helm
+        # Helm creates the ServiceAccount, ClusterRole, ClusterRoleBinding, and Job.
         # pullPolicy=Never — image was loaded locally above, do not pull from registry.
         # cniConfMount.enabled=false — kind nodes are containers; no real /etc/cni/net.d.
         #   The tool falls back to CRD/pod detection automatically.
