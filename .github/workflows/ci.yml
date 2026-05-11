@@ -86,12 +86,12 @@ jobs:
         run: kind load docker-image ${{ env.CI_IMAGE }}
 
       - name: Install devnopes via Helm
-        # Helm creates the ServiceAccount, ClusterRole, ClusterRoleBinding, and Job.
+        # upgrade --install is idempotent: installs on first run, upgrades on re-runs.
         # pullPolicy=Never — image was loaded locally above, do not pull from registry.
         # cniConfMount.enabled=false — kind nodes are containers; no real /etc/cni/net.d.
         #   The tool falls back to CRD/pod detection automatically.
         run: |
-          helm install devnopes ./helm \
+          helm upgrade --install devnopes ./helm \
             -n kube-system \
             --set image.repository=devnopes \
             --set image.tag=ci-test \
