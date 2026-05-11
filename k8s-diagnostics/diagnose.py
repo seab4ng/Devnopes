@@ -219,15 +219,10 @@ def check_coredns(k8s):
         restarts  = sum(cs.restart_count for cs in cs_list)
 
         if phase == "Running" and ready:
-            if restarts > 10:
-                log(f"WARN  {name}  node={node}  Running/Ready  restarts={restarts}", "WARN")
-                IT_ISSUES.append(
-                    f"CoreDNS pod '{name}' has {restarts} restarts — "
-                    "recurring crashes indicate DNS instability"
-                )
-            else:
-                log(f"OK    {name}  node={node}  Running/Ready  restarts={restarts}", "OK")
+            # Pod is healthy right now — restarts are historical, not a current problem
+            log(f"OK    {name}  node={node}  Running/Ready  (restarts={restarts})", "OK")
         else:
+            # Pod is NOT healthy right now — this is a current infrastructure problem
             reason = phase
             for cs in cs_list:
                 if cs.state and cs.state.waiting and cs.state.waiting.reason:
@@ -236,9 +231,9 @@ def check_coredns(k8s):
                 if cs.state and cs.state.terminated and cs.state.terminated.reason:
                     reason = cs.state.terminated.reason
                     break
-            log(f"FAIL  {name}  node={node}  {reason}  restarts={restarts}", "FAIL")
+            log(f"FAIL  {name}  node={node}  {reason}  (restarts={restarts})", "FAIL")
             IT_ISSUES.append(
-                f"CoreDNS pod '{name}' not healthy: {reason} — cluster DNS is degraded"
+                f"CoreDNS pod '{name}' is currently {reason} — cluster DNS is degraded right now"
             )
 
 
@@ -430,28 +425,33 @@ def _detect_cni_from_pods(k8s):
 
 
 def _check_cni_pods(k8s, cni_name, pods):
-    """Given a CNI name and its pods, check readiness and report issues."""
+    """Given a CNI name and its pods, check current readiness only."""
     total = len(pods)
     bad = []
     for p in pods:
+        phase   = p.status.phase
         cs_list = p.status.container_statuses or []
-        if not all(cs.ready for cs in cs_list):
-            reason = p.status.phase
+        ready   = all(cs.ready for cs in cs_list) if cs_list else (phase == "Running")
+        if not ready:
+            reason = phase
             for cs in cs_list:
                 if cs.state and cs.state.waiting and cs.state.waiting.reason:
                     reason = cs.state.waiting.reason
+                    break
+                if cs.state and cs.state.terminated and cs.state.terminated.reason:
+                    reason = cs.state.terminated.reason
                     break
             bad.append((p.metadata.name, p.spec.node_name, reason))
 
     if bad:
         for pname, node, reason in bad:
-            log(f"FAIL  {cni_name} pod '{pname}'  node={node}  {reason}", "FAIL")
+            log(f"FAIL  {cni_name} pod '{pname}'  node={node}  currently {reason}", "FAIL")
             IT_ISSUES.append(
-                f"CNI ({cni_name}) pod '{pname}' on node '{node}': {reason} — "
-                "pod-to-pod networking is broken on that node"
+                f"CNI ({cni_name}) pod '{pname}' on node '{node}' is currently {reason} — "
+                "pod-to-pod networking is broken on that node right now"
             )
     else:
-        log(f"OK    {cni_name}: {total}/{total} pods ready", "OK")
+        log(f"OK    {cni_name}: {total}/{total} pods currently ready", "OK")
 
 
 def check_cni(k8s):
@@ -599,15 +599,10 @@ def check_system_pods(k8s):
         restarts = sum(cs.restart_count for cs in cs_list)
 
         if phase == "Running" and ready:
-            if restarts > 5:
-                log(f"WARN  {name}  node={node}  Running/Ready  restarts={restarts}", "WARN")
-                IT_ISSUES.append(
-                    f"System pod '{name}' has {restarts} restarts — "
-                    "component instability detected"
-                )
-            else:
-                log(f"OK    {name}  node={node}  Running/Ready  restarts={restarts}", "OK")
+            # Pod is healthy right now — restarts are historical, not a current problem
+            log(f"OK    {name}  node={node}  Running/Ready  (restarts={restarts})", "OK")
         else:
+            # Pod is NOT healthy right now — this is a current infrastructure problem
             reason = phase
             for cs in cs_list:
                 if cs.state and cs.state.waiting and cs.state.waiting.reason:
@@ -616,9 +611,9 @@ def check_system_pods(k8s):
                 if cs.state and cs.state.terminated and cs.state.terminated.reason:
                     reason = cs.state.terminated.reason
                     break
-            log(f"FAIL  {name}  node={node}  {reason}  restarts={restarts}", "FAIL")
+            log(f"FAIL  {name}  node={node}  {reason}  (restarts={restarts})", "FAIL")
             IT_ISSUES.append(
-                f"Core system pod '{name}' not healthy: {reason}"
+                f"Core system pod '{name}' is currently {reason}"
             )
 
 
