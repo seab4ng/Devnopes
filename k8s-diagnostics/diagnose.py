@@ -10,17 +10,25 @@ Verdict:
 Checks performed (all infrastructure / cluster-owned):
   1.  Pod DNS resolver config  (/etc/resolv.conf)
   2.  Cluster DNS resolution + timing  (CoreDNS)
-  3.  CoreDNS pod health  (kube-system)
-  4.  kube-proxy daemonset health
+  3.  CoreDNS pod health + recent log errors
+  4.  kube-proxy daemonset health + recent log errors
   5.  CNI plugin pod health  (Calico / Flannel / Cilium / Weave / Antrea / Canal)
   6.  Node conditions  (Ready, NetworkUnavailable, MemoryPressure, DiskPressure, PIDPressure)
   7.  Core system pods health  (kube-system: apiserver, scheduler, etcd, controller-manager)
   8.  Kubernetes API server reachability
   9.  [optional] Service network path test: DNS → ClusterIP TCP → Pod IP TCP
       (set TARGET_SERVICE env var to enable — tests the network path, not the app)
+
+Log scanning policy:
+  Logs are scanned ONLY for CoreDNS and kube-proxy, and ONLY for patterns that
+  are unambiguously a failure of that component's specific function.
+  We look at the last LOG_SCAN_SECONDS seconds only (default: 300 = 5 minutes).
+  A pod that is Running/Ready but logging these errors IS a current infra problem.
+  Generic "error" words, unrelated warnings, or old log lines are never flagged.
 """
 
 import os
+import re
 import sys
 import time
 import socket
@@ -32,6 +40,9 @@ CLUSTER_DOMAIN      = os.environ.get("CLUSTER_DOMAIN",      "cluster.local")
 DNS_SLOW_THRESHOLD  = float(os.environ.get("DNS_SLOW_THRESHOLD", "0.5"))
 DNS_TIMEOUT         = float(os.environ.get("DNS_TIMEOUT",    "3.0"))
 CONNECT_TIMEOUT     = float(os.environ.get("CONNECT_TIMEOUT","3.0"))
+# How far back to look in pod logs. Only the last N seconds are scanned.
+# Older entries are ignored — they are historical and not the current problem.
+LOG_SCAN_SECONDS    = int(os.environ.get("LOG_SCAN_SECONDS", "300"))   # default: 5 minutes
 
 # Optional: test a specific service's network path (infrastructure path only, not the app)
 TARGET_SERVICE      = os.environ.get("TARGET_SERVICE",  "")
@@ -105,6 +116,51 @@ def init_k8s():
         log(f"Kubernetes client unavailable: {e}", "WARN")
         WARNINGS.append("K8s API client could not be initialised — API-based checks skipped")
         return None
+
+
+# ─── Log scanning helper ──────────────────────────────────────────────────────
+#
+# We only ever call this for two infrastructure components:
+#   - CoreDNS  (DNS function)
+#   - kube-proxy  (service routing function)
+#
+# Each call receives a hand-crafted list of patterns that are specific to that
+# component's function. A generic "error" string is never a pattern.
+# We only look at the last LOG_SCAN_SECONDS seconds to avoid historical noise.
+
+def _scan_logs_for_patterns(k8s, namespace, pod_name, container, patterns):
+    """
+    Fetch the last LOG_SCAN_SECONDS seconds of logs for one container and
+    search for specific patterns.
+
+    patterns: list of (compiled_regex, human_readable_meaning)
+
+    Returns list of (meaning, example_line) for each pattern that matched.
+    At most one example line is returned per pattern to keep output concise.
+    """
+    v1 = k8s.CoreV1Api()
+    try:
+        raw = v1.read_namespaced_pod_log(
+            pod_name, namespace,
+            container=container,
+            since_seconds=LOG_SCAN_SECONDS,
+            timestamps=False,
+            limit_bytes=256 * 1024,   # 256 KB cap — never read full multi-GB logs
+        )
+    except Exception as e:
+        WARNINGS.append(f"Could not read logs for {pod_name}/{container}: {e}")
+        return []
+
+    hits = []
+    seen_patterns = set()
+    for line in raw.splitlines():
+        for pattern, meaning in patterns:
+            if meaning in seen_patterns:
+                continue
+            if pattern.search(line):
+                hits.append((meaning, line.strip()))
+                seen_patterns.add(meaning)
+    return hits
 
 
 # ─── Check 1: /etc/resolv.conf ────────────────────────────────────────────────
@@ -186,7 +242,26 @@ def check_cluster_dns():
         )
 
 
-# ─── Check 3: CoreDNS pod health ──────────────────────────────────────────────
+# ─── Check 3: CoreDNS pod health + log scan ───────────────────────────────────
+#
+# Log patterns: ONLY errors that indicate CoreDNS is failing at its DNS function.
+# - [ERROR]       CoreDNS structured error (plugin failure, query processing error)
+# - SERVFAIL      Actively returning SERVFAIL to DNS clients right now
+# - i/o timeout   Cannot reach upstream DNS forwarder
+# - no route to host  Network path to upstream DNS is broken
+# - connection refused  Upstream DNS port closed / firewall blocking
+#
+# What we do NOT flag: info/debug lines, [WARNING], cache messages, reload notices,
+# or any line that does not match these exact patterns.
+
+_COREDNS_LOG_PATTERNS = [
+    (re.compile(r'\[ERROR\]',          re.IGNORECASE), "CoreDNS [ERROR] in recent logs"),
+    (re.compile(r'SERVFAIL',           re.IGNORECASE), "CoreDNS returning SERVFAIL to clients"),
+    (re.compile(r'i/o timeout',        re.IGNORECASE), "CoreDNS upstream i/o timeout"),
+    (re.compile(r'no route to host',   re.IGNORECASE), "CoreDNS: no route to upstream host"),
+    (re.compile(r'connection refused', re.IGNORECASE), "CoreDNS upstream connection refused"),
+]
+
 def check_coredns(k8s):
     section("COREDNS PODS  (kube-system)")
     v1 = k8s.CoreV1Api()
@@ -219,10 +294,26 @@ def check_coredns(k8s):
         restarts  = sum(cs.restart_count for cs in cs_list)
 
         if phase == "Running" and ready:
-            # Pod is healthy right now — restarts are historical, not a current problem
             log(f"OK    {name}  node={node}  Running/Ready  (restarts={restarts})", "OK")
+
+            # Pod is up — but scan recent logs for DNS-function errors.
+            # A pod can be Ready yet actively failing at its job.
+            container_name = cs_list[0].name if cs_list else "coredns"
+            hits = _scan_logs_for_patterns(k8s, "kube-system", name, container_name,
+                                           _COREDNS_LOG_PATTERNS)
+            if hits:
+                for meaning, example in hits:
+                    log(f"FAIL  {name}  log error: {meaning}", "FAIL")
+                    log(f"      example: {example[:120]}", "INFO")
+                    IT_ISSUES.append(
+                        f"CoreDNS pod '{name}' is Running/Ready but has recent log errors "
+                        f"({meaning}) — pod is up but DNS is failing internally. "
+                        f"Example: {example[:120]}"
+                    )
+            else:
+                log(f"OK    {name}  no relevant errors in last {LOG_SCAN_SECONDS}s of logs", "OK")
         else:
-            # Pod is NOT healthy right now — this is a current infrastructure problem
+            # Pod is not healthy right now
             reason = phase
             for cs in cs_list:
                 if cs.state and cs.state.waiting and cs.state.waiting.reason:
@@ -238,9 +329,25 @@ def check_coredns(k8s):
 
 
 # ─── Check 4: kube-proxy ──────────────────────────────────────────────────────
+#
+# Log patterns: ONLY errors that mean kube-proxy is failing to program
+# service routing rules right now. Nothing else.
+# - Failed to sync iptables/ipvs rules  → ClusterIP routing is broken
+# - error syncing rules                 → same, different log format
+#
+# What we do NOT flag: informational messages, reflected config changes,
+# conntrack entries, node port events, or any generic warnings.
+
+_KUBE_PROXY_LOG_PATTERNS = [
+    (re.compile(r'Failed to sync iptables rules', re.IGNORECASE), "kube-proxy failed to sync iptables rules"),
+    (re.compile(r'Failed to sync ipvs rules',     re.IGNORECASE), "kube-proxy failed to sync ipvs rules"),
+    (re.compile(r'error syncing rules',           re.IGNORECASE), "kube-proxy error syncing rules"),
+]
+
 def check_kube_proxy(k8s):
     section("KUBE-PROXY  (service routing)")
     apps = k8s.AppsV1Api()
+    v1   = k8s.CoreV1Api()
 
     try:
         ds      = apps.read_namespaced_daemon_set("kube-proxy", "kube-system")
@@ -256,6 +363,30 @@ def check_kube_proxy(k8s):
             )
         else:
             log(f"OK    kube-proxy: {ready}/{desired} pods ready", "OK")
+
+            # Daemonset looks healthy — scan recent logs for rule-sync failures.
+            # Pick up to 2 pods to check (one is usually enough, but 2 covers multi-node)
+            pods = v1.list_namespaced_pod(
+                "kube-system", label_selector="k8s-app=kube-proxy"
+            ).items[:2]
+
+            for pod in pods:
+                cs_list = pod.status.container_statuses or []
+                container_name = cs_list[0].name if cs_list else "kube-proxy"
+                hits = _scan_logs_for_patterns(k8s, "kube-system", pod.metadata.name,
+                                               container_name, _KUBE_PROXY_LOG_PATTERNS)
+                if hits:
+                    for meaning, example in hits:
+                        log(f"FAIL  {pod.metadata.name}  log error: {meaning}", "FAIL")
+                        log(f"      example: {example[:120]}", "INFO")
+                        IT_ISSUES.append(
+                            f"kube-proxy pod '{pod.metadata.name}' is Running/Ready but "
+                            f"has recent log errors ({meaning}) — "
+                            f"service routing rules are not being applied correctly. "
+                            f"Example: {example[:120]}"
+                        )
+                else:
+                    log(f"OK    {pod.metadata.name}  no rule-sync errors in last {LOG_SCAN_SECONDS}s of logs", "OK")
 
     except Exception as e:
         status = getattr(e, "status", None)

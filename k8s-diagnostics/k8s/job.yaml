@@ -100,6 +100,8 @@ spec:
             #   value: "3.0"
             # - name: CONNECT_TIMEOUT
             #   value: "3.0"
+            # - name: LOG_SCAN_SECONDS
+            #   value: "300"           # how far back to look in CoreDNS/kube-proxy logs (default: 5 min)
 
           resources:
             requests:
