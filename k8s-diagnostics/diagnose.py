@@ -1,9 +1,23 @@
 #!/usr/bin/env python3
 """
-k8s-diagnostics: Cluster vs Deployment Issue Differentiator
-Runs as a K8s Job and determines whether observed problems are:
-  - IT TEAM responsibility  (cluster infra: DNS, CNI, kube-proxy, nodes)
-  - DEVOPS responsibility   (deployment:    bad image, wrong selector, missing config)
+k8s-diagnostics: Cluster Infrastructure Health Checker
+Checks ONLY cluster-level components — not application workloads.
+
+Verdict:
+  IT TEAM RESPONSIBILITY  — if any infrastructure issue is found
+  INFRASTRUCTURE HEALTHY  — if all checks pass
+
+Checks performed (all infrastructure / cluster-owned):
+  1.  Pod DNS resolver config  (/etc/resolv.conf)
+  2.  Cluster DNS resolution + timing  (CoreDNS)
+  3.  CoreDNS pod health  (kube-system)
+  4.  kube-proxy daemonset health
+  5.  CNI plugin pod health  (Calico / Flannel / Cilium / Weave / Antrea / Canal)
+  6.  Node conditions  (Ready, NetworkUnavailable, MemoryPressure, DiskPressure, PIDPressure)
+  7.  Core system pods health  (kube-system: apiserver, scheduler, etcd, controller-manager)
+  8.  Kubernetes API server reachability
+  9.  [optional] Service network path test: DNS → ClusterIP TCP → Pod IP TCP
+      (set TARGET_SERVICE env var to enable — tests the network path, not the app)
 """
 
 import os
@@ -13,49 +27,45 @@ import socket
 import threading
 from datetime import datetime, timezone
 
-# ─── Configuration (override via env vars in the Job manifest) ────────────────
-TARGET_NAMESPACE    = os.environ.get("TARGET_NAMESPACE",    "default")
-TARGET_SERVICE      = os.environ.get("TARGET_SERVICE",      "")   # specific svc to deep-test
-TARGET_PORT         = int(os.environ.get("TARGET_PORT",     "80"))
+# ─── Configuration ────────────────────────────────────────────────────────────
 CLUSTER_DOMAIN      = os.environ.get("CLUSTER_DOMAIN",      "cluster.local")
-DNS_SLOW_THRESHOLD  = float(os.environ.get("DNS_SLOW_THRESHOLD", "0.5"))   # seconds
-DNS_TIMEOUT         = float(os.environ.get("DNS_TIMEOUT",   "3.0"))
+DNS_SLOW_THRESHOLD  = float(os.environ.get("DNS_SLOW_THRESHOLD", "0.5"))
+DNS_TIMEOUT         = float(os.environ.get("DNS_TIMEOUT",    "3.0"))
 CONNECT_TIMEOUT     = float(os.environ.get("CONNECT_TIMEOUT","3.0"))
 
-# ─── Finding buckets ─────────────────────────────────────────────────────────
-IT_ISSUES     = []   # cluster/infra problems  → IT Team
-DEVOPS_ISSUES = []   # deployment/config problems → DevOps
-WARNINGS      = []   # informational / ambiguous
+# Optional: test a specific service's network path (infrastructure path only, not the app)
+TARGET_SERVICE      = os.environ.get("TARGET_SERVICE",  "")
+TARGET_NAMESPACE    = os.environ.get("TARGET_NAMESPACE","default")
+TARGET_PORT         = int(os.environ.get("TARGET_PORT", "80"))
 
-# ─── Helpers ─────────────────────────────────────────────────────────────────
+# ─── Finding bucket — only one category: IT Team ─────────────────────────────
+IT_ISSUES = []    # every problem here is cluster/infra — IT Team's responsibility
+WARNINGS  = []    # informational / unable to verify
+
+# ─── Output helpers ───────────────────────────────────────────────────────────
 def ts():
     return datetime.now().strftime("%H:%M:%S")
 
-ICONS = {"OK": "✓", "FAIL": "✗", "WARN": "⚠", "INFO": "·"}
-
 def log(msg, level="INFO"):
-    icon = ICONS.get(level, "·")
+    icon = {"OK": "✓", "FAIL": "✗", "WARN": "⚠", "INFO": "·"}.get(level, "·")
     print(f"[{ts()}] {icon} {msg}", flush=True)
 
 def section(title):
-    print(f"\n{'─'*62}", flush=True)
+    print(f"\n{'─'*64}", flush=True)
     print(f"  {title}", flush=True)
-    print(f"{'─'*62}", flush=True)
+    print(f"{'─'*64}", flush=True)
 
 
 # ─── Network primitives ───────────────────────────────────────────────────────
 def resolve_with_timing(hostname, timeout=None):
-    """
-    Returns (ip_list, elapsed_seconds, error_string).
-    Uses a daemon thread so we can enforce a hard timeout on getaddrinfo.
-    """
+    """Returns (ip_list, elapsed, error_string). Hard-timeouts via daemon thread."""
     timeout = timeout or DNS_TIMEOUT
     ips, err = [None], [None]
 
     def _work():
         try:
             results = socket.getaddrinfo(hostname, None, socket.AF_INET)
-            ips[0] = list(dict.fromkeys(r[4][0] for r in results))  # dedup, preserve order
+            ips[0] = list(dict.fromkeys(r[4][0] for r in results))
         except Exception as e:
             err[0] = str(e)
 
@@ -82,7 +92,7 @@ def tcp_connect(host, port, timeout=None):
         return False, time.monotonic() - start, str(e)
 
 
-# ─── K8s client setup ─────────────────────────────────────────────────────────
+# ─── K8s client ───────────────────────────────────────────────────────────────
 def init_k8s():
     try:
         from kubernetes import client, config
@@ -97,163 +107,200 @@ def init_k8s():
         return None
 
 
-# ─── Check 1: Pod DNS resolver config ────────────────────────────────────────
+# ─── Check 1: /etc/resolv.conf ────────────────────────────────────────────────
 def check_resolv_conf():
     section("POD DNS RESOLVER CONFIG  (/etc/resolv.conf)")
     try:
         with open("/etc/resolv.conf") as f:
             lines = f.read().strip().splitlines()
+
         nameservers = [l.split()[1] for l in lines if l.startswith("nameserver")]
-        search_domains = next((l.split()[1:] for l in lines if l.startswith("search")), [])
-        options = next((l for l in lines if l.startswith("options")), None)
+        search      = next((l.split()[1:] for l in lines if l.startswith("search")), [])
+        options     = next((l for l in lines if l.startswith("options")), None)
 
         for ns in nameservers:
             log(f"nameserver : {ns}", "INFO")
-        log(f"search     : {' '.join(search_domains)}", "INFO")
+        log(f"search     : {' '.join(search) or '(none)'}", "INFO")
         if options:
             log(f"options    : {options}", "INFO")
 
         if not nameservers:
-            log("No nameserver entries — DNS is broken at pod level", "FAIL")
-            IT_ISSUES.append("No nameserver in /etc/resolv.conf — pod has no DNS resolver configured")
+            log("No nameserver entries found", "FAIL")
+            IT_ISSUES.append(
+                "No nameserver in /etc/resolv.conf — "
+                "cluster DNS is not injected into pods (kubelet or CNI misconfiguration)"
+            )
 
-        return nameservers
     except Exception as e:
         log(f"Cannot read /etc/resolv.conf: {e}", "WARN")
-        return []
+        WARNINGS.append(f"Could not read /etc/resolv.conf: {e}")
 
 
-# ─── Check 2: Core cluster DNS names ─────────────────────────────────────────
+# ─── Check 2: Cluster DNS resolution + timing ─────────────────────────────────
 def check_cluster_dns():
-    section("CLUSTER DNS RESOLUTION")
+    section("CLUSTER DNS RESOLUTION  (CoreDNS)")
 
-    core_names = [
-        f"kubernetes.default.svc.{CLUSTER_DOMAIN}",     # must always resolve
-        f"kube-dns.kube-system.svc.{CLUSTER_DOMAIN}",   # CoreDNS service itself
-        "kubernetes",                                    # short-name resolution
+    # These names MUST resolve in any healthy cluster — they are cluster-owned, not app-owned
+    probes = [
+        (f"kubernetes.default.svc.{CLUSTER_DOMAIN}",  "K8s API service (canonical cluster DNS test)"),
+        (f"kube-dns.kube-system.svc.{CLUSTER_DOMAIN}", "CoreDNS service itself"),
+        ("kubernetes",                                  "Short-name resolution (ndots + search path)"),
     ]
 
-    dns_ok = True
-    for name in core_names:
+    for name, description in probes:
         ips, elapsed, err = resolve_with_timing(name)
         if err:
-            log(f"FAIL  {name}  →  {err}", "FAIL")
+            log(f"FAIL  {name}", "FAIL")
+            log(f"      ({description})", "INFO")
+            log(f"      error: {err}", "INFO")
             IT_ISSUES.append(
-                f"DNS resolution failed for '{name}': {err} "
-                f"→ CoreDNS is not functioning"
+                f"DNS resolution failed — '{name}' ({description}): {err}"
             )
-            dns_ok = False
         elif elapsed > DNS_SLOW_THRESHOLD:
             log(f"SLOW  {name}  →  {ips}  ({elapsed:.3f}s  >  {DNS_SLOW_THRESHOLD}s)", "WARN")
+            log(f"      ({description})", "INFO")
             IT_ISSUES.append(
-                f"DNS slow: '{name}' resolved in {elapsed:.3f}s (threshold {DNS_SLOW_THRESHOLD}s) "
-                f"→ CoreDNS overloaded, misconfigured, or upstream forwarder unreachable"
+                f"DNS slow — '{name}' resolved in {elapsed:.3f}s "
+                f"(threshold {DNS_SLOW_THRESHOLD}s): "
+                f"CoreDNS overloaded, upstream forwarder unreachable, or ndots misconfigured"
             )
-            dns_ok = False
         else:
             log(f"OK    {name}  →  {ips}  ({elapsed:.3f}s)", "OK")
 
-    # NXDOMAIN sanity check — proves DNS is actually answering, not silently timing out
-    nxname = f"nxdomain-check-xyzabc.kube-system.svc.{CLUSTER_DOMAIN}"
+    # NXDOMAIN sanity — proves CoreDNS is actually answering authoritatively
+    nxname = f"nxdomain-probe-xyzabc99.kube-system.svc.{CLUSTER_DOMAIN}"
     ips, elapsed, err = resolve_with_timing(nxname, timeout=DNS_TIMEOUT)
     if ips:
-        log(f"WARN  NXDOMAIN test returned IPs {ips} — wildcard DNS active?", "WARN")
-        WARNINGS.append("Wildcard DNS detected — resolution failures may be masked")
+        log(f"WARN  NXDOMAIN probe resolved to {ips} — wildcard DNS active?", "WARN")
+        WARNINGS.append(
+            "Wildcard DNS detected: non-existent cluster names resolve to an IP. "
+            "DNS failures may be silently masked."
+        )
+    elif err and elapsed < DNS_TIMEOUT:
+        log(f"OK    NXDOMAIN probe: non-existent name correctly refused  ({elapsed:.3f}s)", "OK")
     else:
-        log(f"OK    NXDOMAIN test: non-existent name correctly not resolved ({elapsed:.3f}s)", "OK")
+        log(f"WARN  NXDOMAIN probe timed out ({elapsed:.3f}s) — CoreDNS may be unresponsive", "WARN")
+        IT_ISSUES.append(
+            f"CoreDNS did not respond to NXDOMAIN probe within {DNS_TIMEOUT}s — "
+            "DNS queries may be silently dropped"
+        )
 
-    return dns_ok
 
-
-# ─── Check 3: CoreDNS pod health ─────────────────────────────────────────────
+# ─── Check 3: CoreDNS pod health ──────────────────────────────────────────────
 def check_coredns(k8s):
     section("COREDNS PODS  (kube-system)")
     v1 = k8s.CoreV1Api()
 
-    # Try both common label selectors
     pods = []
-    for selector in ("k8s-app=kube-dns", "app=coredns", "app.kubernetes.io/name=coredns"):
+    for selector in (
+        "k8s-app=kube-dns",
+        "app=coredns",
+        "app.kubernetes.io/name=coredns",
+        "k8s-app=coredns",
+    ):
         pods = v1.list_namespaced_pod("kube-system", label_selector=selector).items
         if pods:
             break
 
     if not pods:
         log("No CoreDNS/kube-dns pods found in kube-system", "FAIL")
-        IT_ISSUES.append("CRITICAL: No CoreDNS/kube-dns pods in kube-system — cluster DNS is absent")
+        IT_ISSUES.append(
+            "CRITICAL: No CoreDNS/kube-dns pods in kube-system — "
+            "cluster DNS component is missing or deleted"
+        )
         return
 
     for pod in pods:
-        name = pod.metadata.name
-        node = pod.spec.node_name
-        phase = pod.status.phase
-        container_statuses = pod.status.container_statuses or []
-        ready = all(cs.ready for cs in container_statuses)
-        restarts = sum(cs.restart_count for cs in container_statuses)
+        name      = pod.metadata.name
+        node      = pod.spec.node_name
+        phase     = pod.status.phase
+        cs_list   = pod.status.container_statuses or []
+        ready     = all(cs.ready for cs in cs_list)
+        restarts  = sum(cs.restart_count for cs in cs_list)
 
         if phase == "Running" and ready:
             if restarts > 10:
-                log(f"WARN  {name} on {node}: Running but {restarts} restarts", "WARN")
+                log(f"WARN  {name}  node={node}  Running/Ready  restarts={restarts}", "WARN")
                 IT_ISSUES.append(
-                    f"CoreDNS pod '{name}' has {restarts} restarts → DNS instability / recurring crashes"
+                    f"CoreDNS pod '{name}' has {restarts} restarts — "
+                    "recurring crashes indicate DNS instability"
                 )
             else:
-                log(f"OK    {name} on {node}: Running/Ready  ({restarts} restarts)", "OK")
+                log(f"OK    {name}  node={node}  Running/Ready  restarts={restarts}", "OK")
         else:
             reason = phase
-            for cs in container_statuses:
+            for cs in cs_list:
                 if cs.state and cs.state.waiting and cs.state.waiting.reason:
                     reason = cs.state.waiting.reason
                     break
-            log(f"FAIL  {name} on {node}: {reason}  ({restarts} restarts)", "FAIL")
-            IT_ISSUES.append(f"CoreDNS pod '{name}' not healthy: {reason}")
+                if cs.state and cs.state.terminated and cs.state.terminated.reason:
+                    reason = cs.state.terminated.reason
+                    break
+            log(f"FAIL  {name}  node={node}  {reason}  restarts={restarts}", "FAIL")
+            IT_ISSUES.append(
+                f"CoreDNS pod '{name}' not healthy: {reason} — cluster DNS is degraded"
+            )
 
 
-# ─── Check 4: kube-proxy + CNI ───────────────────────────────────────────────
-def check_network_components(k8s):
-    section("KUBE-PROXY + CNI DAEMONSETS")
+# ─── Check 4: kube-proxy ──────────────────────────────────────────────────────
+def check_kube_proxy(k8s):
+    section("KUBE-PROXY  (service routing)")
     apps = k8s.AppsV1Api()
-    v1   = k8s.CoreV1Api()
 
-    # kube-proxy
     try:
-        ds = apps.read_namespaced_daemon_set("kube-proxy", "kube-system")
+        ds      = apps.read_namespaced_daemon_set("kube-proxy", "kube-system")
         desired = ds.status.desired_number_scheduled or 0
         ready   = ds.status.number_ready or 0
+        updated = ds.status.updated_number_scheduled or 0
+
         if ready < desired:
-            log(f"FAIL  kube-proxy: {ready}/{desired} pods ready", "FAIL")
+            log(f"FAIL  kube-proxy: {ready}/{desired} pods ready  (updated={updated})", "FAIL")
             IT_ISSUES.append(
-                f"kube-proxy: {ready}/{desired} pods ready → "
-                f"ClusterIP/NodePort routing broken on some nodes"
+                f"kube-proxy: {ready}/{desired} pods ready — "
+                "ClusterIP and NodePort routing is broken on unreachable nodes"
             )
         else:
             log(f"OK    kube-proxy: {ready}/{desired} pods ready", "OK")
+
     except Exception as e:
         status = getattr(e, "status", None)
         if status == 404:
-            log("INFO  kube-proxy daemonset not found — cluster may use eBPF dataplane (Cilium/Calico eBPF)", "INFO")
-            WARNINGS.append("kube-proxy not found; eBPF dataplane assumed")
+            log("INFO  kube-proxy daemonset not found — eBPF dataplane assumed (Cilium / Calico eBPF)", "INFO")
+            WARNINGS.append(
+                "kube-proxy daemonset not found; cluster likely uses an eBPF dataplane. "
+                "Verify CNI handles service routing."
+            )
         else:
             log(f"WARN  Cannot read kube-proxy daemonset: {e}", "WARN")
+            WARNINGS.append(f"Could not verify kube-proxy: {e}")
 
-    # CNI — try common labels
-    cni_candidates = [
-        ("k8s-app=calico-node",           "Calico"),
-        ("app=flannel",                   "Flannel"),
-        ("k8s-app=flannel",               "Flannel"),
-        ("app=cilium",                    "Cilium"),
-        ("name=weave-net",                "Weave"),
-        ("app=canal",                     "Canal"),
-        ("app=antrea-agent",              "Antrea"),
-        ("app.kubernetes.io/name=calico", "Calico"),
+
+# ─── Check 5: CNI plugin ──────────────────────────────────────────────────────
+def check_cni(k8s):
+    section("CNI PLUGIN  (pod networking)")
+    v1 = k8s.CoreV1Api()
+
+    candidates = [
+        ("k8s-app=calico-node",                   "Calico"),
+        ("app=flannel",                            "Flannel"),
+        ("k8s-app=flannel",                        "Flannel"),
+        ("app=cilium",                             "Cilium"),
+        ("name=weave-net",                         "Weave"),
+        ("app=canal",                              "Canal"),
+        ("app=antrea-agent",                       "Antrea"),
+        ("app.kubernetes.io/name=calico",          "Calico"),
+        ("app.kubernetes.io/component=calico-node","Calico"),
+        ("k8s-app=calico-node",                    "Calico"),
     ]
 
     cni_found = False
-    for selector, cni_name in cni_candidates:
+    for selector, cni_name in candidates:
         try:
             pods = v1.list_namespaced_pod("kube-system", label_selector=selector).items
             if not pods:
                 continue
             cni_found = True
+
             bad = [p for p in pods if not all(
                 cs.ready for cs in (p.status.container_statuses or [])
             )]
@@ -264,10 +311,11 @@ def check_network_components(k8s):
                         if cs.state and cs.state.waiting and cs.state.waiting.reason:
                             reason = cs.state.waiting.reason
                             break
-                    log(f"FAIL  {cni_name} pod {p.metadata.name}: {reason}", "FAIL")
+                    node = p.spec.node_name
+                    log(f"FAIL  {cni_name} pod '{p.metadata.name}'  node={node}  {reason}", "FAIL")
                     IT_ISSUES.append(
-                        f"CNI ({cni_name}) pod '{p.metadata.name}' not healthy: {reason} "
-                        f"→ pod networking broken on that node"
+                        f"CNI ({cni_name}) pod '{p.metadata.name}' on node '{node}': {reason} — "
+                        "pod-to-pod networking is broken on that node"
                     )
             else:
                 log(f"OK    {cni_name}: {len(pods)}/{len(pods)} pods ready", "OK")
@@ -276,19 +324,33 @@ def check_network_components(k8s):
             continue
 
     if not cni_found:
-        log("WARN  No CNI pods detected with known labels", "WARN")
-        WARNINGS.append("CNI pods not found with known labels — verify CNI manually")
+        log("WARN  No CNI pods found with known labels", "WARN")
+        WARNINGS.append(
+            "CNI pods not found under any known label selector "
+            "(Calico/Flannel/Cilium/Weave/Canal/Antrea) — verify CNI manually"
+        )
 
 
-# ─── Check 5: Node conditions ─────────────────────────────────────────────────
+# ─── Check 6: Node conditions ─────────────────────────────────────────────────
 def check_nodes(k8s):
     section("NODE CONDITIONS")
     v1 = k8s.CoreV1Api()
+
     nodes = v1.list_node().items
+    if not nodes:
+        log("No nodes returned from API", "FAIL")
+        IT_ISSUES.append("No nodes found — API server may be degraded")
+        return
 
     for node in nodes:
-        name = node.metadata.name
+        name     = node.metadata.name
         cond_map = {c.type: c.status for c in node.status.conditions}
+        roles    = [
+            k.replace("node-role.kubernetes.io/", "")
+            for k in (node.metadata.labels or {})
+            if k.startswith("node-role.kubernetes.io/")
+        ]
+        role_str = ",".join(roles) if roles else "worker"
 
         problems = []
         if cond_map.get("Ready") != "True":
@@ -299,341 +361,296 @@ def check_nodes(k8s):
             problems.append("MemoryPressure")
         if cond_map.get("DiskPressure") == "True":
             problems.append("DiskPressure")
+        if cond_map.get("PIDPressure") == "True":
+            problems.append("PIDPressure")
 
         if problems:
-            log(f"FAIL  {name}: {', '.join(problems)}", "FAIL")
+            log(f"FAIL  {name}  [{role_str}]  conditions: {', '.join(problems)}", "FAIL")
             for p in problems:
-                IT_ISSUES.append(f"Node '{name}' condition: {p}")
+                IT_ISSUES.append(
+                    f"Node '{name}' [{role_str}]: {p}"
+                )
         else:
-            log(f"OK    {name}: Ready", "OK")
+            log(f"OK    {name}  [{role_str}]  Ready", "OK")
 
 
-# ─── Check 6: Deployments and pods in target namespace ───────────────────────
-def check_deployments(k8s):
-    section(f"DEPLOYMENTS + PODS  (namespace: {TARGET_NAMESPACE})")
-    apps = k8s.AppsV1Api()
-    v1   = k8s.CoreV1Api()
-
-    deployments = apps.list_namespaced_deployment(TARGET_NAMESPACE).items
-    if not deployments:
-        log(f"No deployments found in namespace '{TARGET_NAMESPACE}'", "WARN")
-        WARNINGS.append(
-            f"No deployments in '{TARGET_NAMESPACE}' — wrong namespace? Helm release not installed?"
-        )
-        return
-
-    for dep in deployments:
-        dname   = dep.metadata.name
-        desired = dep.spec.replicas or 0
-        ready   = dep.status.ready_replicas or 0
-
-        if ready >= desired:
-            log(f"OK    {dname}: {ready}/{desired} replicas ready", "OK")
-            continue
-
-        log(f"FAIL  {dname}: {ready}/{desired} replicas ready — investigating pods...", "FAIL")
-
-        # Dig into pods
-        label_sel = ",".join(
-            f"{k}={v}" for k, v in (dep.spec.selector.match_labels or {}).items()
-        )
-        pods = v1.list_namespaced_pod(TARGET_NAMESPACE, label_selector=label_sel).items
-
-        for pod in pods:
-            pname = pod.metadata.name
-            phase = pod.status.phase
-
-            for cs in (pod.status.container_statuses or []):
-                if cs.ready:
-                    continue
-                restarts = cs.restart_count
-
-                if cs.state and cs.state.waiting:
-                    reason = cs.state.waiting.reason or "Unknown"
-                    msg    = cs.state.waiting.message or ""
-
-                    if reason in ("ImagePullBackOff", "ErrImagePull", "InvalidImageName"):
-                        DEVOPS_ISSUES.append(
-                            f"Pod '{pname}' container '{cs.name}': {reason} "
-                            f"(image: {cs.image}) — wrong image tag or registry unreachable in airgap"
-                        )
-                    elif reason == "CrashLoopBackOff":
-                        DEVOPS_ISSUES.append(
-                            f"Pod '{pname}' container '{cs.name}': CrashLoopBackOff ({restarts} restarts) "
-                            f"— application crashes on startup; check app config/secrets/logs"
-                        )
-                    elif reason == "CreateContainerConfigError":
-                        DEVOPS_ISSUES.append(
-                            f"Pod '{pname}' container '{cs.name}': CreateContainerConfigError "
-                            f"— missing Secret or ConfigMap referenced in deployment"
-                        )
-                    elif reason == "OOMKilled":
-                        DEVOPS_ISSUES.append(
-                            f"Pod '{pname}' container '{cs.name}': OOMKilled "
-                            f"— memory limit too low; increase resources in Helm values"
-                        )
-                    elif reason in ("ContainerCreating", "PodInitializing"):
-                        pass  # transient
-                    else:
-                        DEVOPS_ISSUES.append(
-                            f"Pod '{pname}' container '{cs.name}': {reason} — {msg}"
-                        )
-
-                elif cs.state and cs.state.terminated:
-                    exit_code = cs.state.terminated.exit_code
-                    treason   = cs.state.terminated.reason or f"exit {exit_code}"
-                    if exit_code != 0:
-                        DEVOPS_ISSUES.append(
-                            f"Pod '{pname}' container '{cs.name}': terminated ({treason}) "
-                            f"— non-zero exit; check application logs"
-                        )
-
-
-# ─── Check 7: Service endpoints ──────────────────────────────────────────────
-def check_services_and_endpoints(k8s):
-    section(f"SERVICES + ENDPOINTS  (namespace: {TARGET_NAMESPACE})")
+# ─── Check 7: Core system component pods (kube-system) ───────────────────────
+def check_system_pods(k8s):
+    section("CORE SYSTEM PODS  (kube-system)")
     v1 = k8s.CoreV1Api()
 
-    services = v1.list_namespaced_service(TARGET_NAMESPACE).items
-    if not services:
-        log(f"No services in namespace '{TARGET_NAMESPACE}'", "WARN")
+    # Component pod prefixes that belong to the cluster infrastructure
+    infra_prefixes = (
+        "kube-apiserver",
+        "kube-scheduler",
+        "kube-controller-manager",
+        "etcd",
+        "kube-proxy",
+        "coredns",
+        "kube-dns",
+    )
+
+    all_pods = v1.list_namespaced_pod("kube-system").items
+    infra_pods = [
+        p for p in all_pods
+        if any(p.metadata.name.startswith(prefix) for prefix in infra_prefixes)
+    ]
+
+    if not infra_pods:
+        log("No standard control-plane pods found in kube-system (managed control plane?)", "WARN")
+        WARNINGS.append(
+            "No kube-apiserver/etcd/scheduler pods found in kube-system — "
+            "control plane may be managed externally (EKS/GKE/AKS/Rancher hosted)"
+        )
         return
 
-    for svc in services:
-        if svc.spec.type == "ExternalName":
-            continue
-        sname      = svc.metadata.name
-        cluster_ip = svc.spec.cluster_ip
+    for pod in infra_pods:
+        name     = pod.metadata.name
+        node     = pod.spec.node_name
+        phase    = pod.status.phase
+        cs_list  = pod.status.container_statuses or []
+        ready    = all(cs.ready for cs in cs_list) if cs_list else (phase == "Running")
+        restarts = sum(cs.restart_count for cs in cs_list)
 
-        try:
-            ep = v1.read_namespaced_endpoints(sname, TARGET_NAMESPACE)
-            ready_addrs = []
-            for subset in (ep.subsets or []):
-                ready_addrs.extend(subset.addresses or [])
-
-            if not ready_addrs:
-                log(f"FAIL  Service '{sname}' ({cluster_ip}): 0 ready endpoints", "FAIL")
-                DEVOPS_ISSUES.append(
-                    f"Service '{sname}' has no ready endpoints — "
-                    f"pod selector does not match any running pod labels, "
-                    f"or all backing pods are unhealthy"
+        if phase == "Running" and ready:
+            if restarts > 5:
+                log(f"WARN  {name}  node={node}  Running/Ready  restarts={restarts}", "WARN")
+                IT_ISSUES.append(
+                    f"System pod '{name}' has {restarts} restarts — "
+                    "component instability detected"
                 )
             else:
-                pod_ips = [a.ip for a in ready_addrs]
-                log(f"OK    Service '{sname}' ({cluster_ip}): {len(pod_ips)} endpoint(s) {pod_ips}", "OK")
-        except Exception as e:
-            log(f"WARN  Cannot read endpoints for '{sname}': {e}", "WARN")
+                log(f"OK    {name}  node={node}  Running/Ready  restarts={restarts}", "OK")
+        else:
+            reason = phase
+            for cs in cs_list:
+                if cs.state and cs.state.waiting and cs.state.waiting.reason:
+                    reason = cs.state.waiting.reason
+                    break
+                if cs.state and cs.state.terminated and cs.state.terminated.reason:
+                    reason = cs.state.terminated.reason
+                    break
+            log(f"FAIL  {name}  node={node}  {reason}  restarts={restarts}", "FAIL")
+            IT_ISSUES.append(
+                f"Core system pod '{name}' not healthy: {reason}"
+            )
 
 
-# ─── Check 8: Resource quotas ─────────────────────────────────────────────────
-def check_resource_quotas(k8s):
+# ─── Check 8: API server reachability ────────────────────────────────────────
+def check_apiserver(k8s):
+    section("KUBERNETES API SERVER")
     v1 = k8s.CoreV1Api()
+
+    # The kubernetes service in default namespace is the in-cluster API server endpoint
     try:
-        quotas = v1.list_namespaced_resource_quota(TARGET_NAMESPACE).items
-    except Exception:
-        return
-    if not quotas:
-        return
+        svc = v1.read_namespaced_service("kubernetes", "default")
+        api_ip   = svc.spec.cluster_ip
+        api_port = next(
+            (p.port for p in svc.spec.ports if p.name in ("https", "443")),
+            443
+        )
+        log(f"INFO  API server ClusterIP: {api_ip}:{api_port}", "INFO")
 
-    section(f"RESOURCE QUOTAS  (namespace: {TARGET_NAMESPACE})")
-    for quota in quotas:
-        hard = quota.status.hard or {}
-        used = quota.status.used or {}
-        for resource in ("pods", "requests.cpu", "requests.memory", "limits.cpu", "limits.memory"):
-            if resource not in hard:
-                continue
-            h, u = hard[resource], used.get(resource, "0")
-            log(f"INFO  {quota.metadata.name} — {resource}: used={u}  limit={h}", "INFO")
-            if resource == "pods":
-                try:
-                    if int(u) >= int(h):
-                        log(f"FAIL  Pod quota EXHAUSTED: {u}/{h}", "FAIL")
-                        DEVOPS_ISSUES.append(
-                            f"ResourceQuota '{quota.metadata.name}': pod limit reached ({u}/{h}) "
-                            f"— new pods cannot be scheduled"
-                        )
-                except ValueError:
-                    pass
+        # DNS resolution
+        ips, elapsed, err = resolve_with_timing(f"kubernetes.default.svc.{CLUSTER_DOMAIN}")
+        if err:
+            log(f"FAIL  DNS for kubernetes service: {err}", "FAIL")
+            IT_ISSUES.append(f"Cannot resolve kubernetes API service DNS: {err}")
+        elif elapsed > DNS_SLOW_THRESHOLD:
+            log(f"SLOW  kubernetes service DNS resolved in {elapsed:.3f}s", "WARN")
+            IT_ISSUES.append(f"API server DNS slow ({elapsed:.3f}s) — CoreDNS issue")
+        else:
+            log(f"OK    kubernetes service DNS: {ips}  ({elapsed:.3f}s)", "OK")
+
+        # TCP reachability
+        ok, elapsed, err = tcp_connect(api_ip, api_port)
+        if ok:
+            log(f"OK    TCP connect to API server {api_ip}:{api_port}  ({elapsed:.3f}s)", "OK")
+        else:
+            log(f"FAIL  TCP connect to API server {api_ip}:{api_port}: {err}", "FAIL")
+            IT_ISSUES.append(
+                f"Kubernetes API server {api_ip}:{api_port} not reachable via TCP: {err} — "
+                "control plane networking issue"
+            )
+
+    except Exception as e:
+        log(f"WARN  Cannot inspect kubernetes service: {e}", "WARN")
+        WARNINGS.append(f"Could not verify API server service: {e}")
 
 
-# ─── Check 9: Target service deep-test (DNS vs ClusterIP vs Pod IP) ──────────
-def check_target_service(k8s):
-    if not TARGET_SERVICE:
-        return
-
-    section(f"SERVICE DEEP-TEST  →  {TARGET_SERVICE}.{TARGET_NAMESPACE}  port {TARGET_PORT}")
+# ─── Check 9: Service network path test (infrastructure path only) ────────────
+def check_service_network_path(k8s):
+    """
+    Tests the network infrastructure path for a given service:
+      DNS resolution → ClusterIP TCP → Pod IP TCP
+    This is a network/infrastructure test — it tells you WHERE in the stack
+    the problem is, not whether the application is healthy.
+    """
+    section(
+        f"SERVICE NETWORK PATH TEST  "
+        f"{TARGET_SERVICE}.{TARGET_NAMESPACE} :{TARGET_PORT}"
+    )
     fqdn = f"{TARGET_SERVICE}.{TARGET_NAMESPACE}.svc.{CLUSTER_DOMAIN}"
     v1   = k8s.CoreV1Api()
 
-    # ── Step 1: DNS ──────────────────────────────────────────────────────────
-    log(f"[1/4] DNS resolution: {fqdn}")
+    # Step 1 — DNS
+    log(f"[1/4] DNS:        {fqdn}")
     dns_ips, dns_elapsed, dns_err = resolve_with_timing(fqdn)
 
     if dns_err:
         log(f"      FAIL  {dns_err}  ({dns_elapsed:.3f}s)", "FAIL")
-        IT_ISSUES.append(f"Service DNS '{fqdn}' not resolvable: {dns_err}")
-    elif dns_elapsed > DNS_SLOW_THRESHOLD:
-        log(f"      SLOW  {dns_ips}  ({dns_elapsed:.3f}s  >  {DNS_SLOW_THRESHOLD}s)", "WARN")
         IT_ISSUES.append(
-            f"DNS slow for '{fqdn}': {dns_elapsed:.3f}s — CoreDNS performance issue"
+            f"DNS failed for '{fqdn}': {dns_err} — CoreDNS cannot resolve cluster services"
+        )
+    elif dns_elapsed > DNS_SLOW_THRESHOLD:
+        log(f"      SLOW  {dns_ips}  ({dns_elapsed:.3f}s)", "WARN")
+        IT_ISSUES.append(
+            f"DNS slow for '{fqdn}': {dns_elapsed:.3f}s — CoreDNS performance problem"
         )
     else:
         log(f"      OK    {dns_ips}  ({dns_elapsed:.3f}s)", "OK")
 
-    # ── Step 2: K8s API ClusterIP (ground truth) ──────────────────────────────
-    log(f"[2/4] ClusterIP from K8s API")
-    api_cluster_ip = None
+    # Step 2 — Ground-truth ClusterIP from API
+    log(f"[2/4] ClusterIP:  from K8s API (ground truth)")
+    api_ip = None
     try:
-        svc = v1.read_namespaced_service(TARGET_SERVICE, TARGET_NAMESPACE)
-        api_cluster_ip = svc.spec.cluster_ip
-        log(f"      OK    ClusterIP = {api_cluster_ip}", "OK")
-
-        if dns_ips and api_cluster_ip not in dns_ips:
-            log(f"      FAIL  DNS returned {dns_ips} but actual ClusterIP is {api_cluster_ip}", "FAIL")
+        svc    = v1.read_namespaced_service(TARGET_SERVICE, TARGET_NAMESPACE)
+        api_ip = svc.spec.cluster_ip
+        log(f"      OK    ClusterIP = {api_ip}", "OK")
+        if dns_ips and api_ip not in dns_ips:
+            log(f"      FAIL  DNS returned {dns_ips}, actual is {api_ip}", "FAIL")
             IT_ISSUES.append(
                 f"DNS returned wrong IP for '{TARGET_SERVICE}': "
-                f"DNS={dns_ips}, actual={api_cluster_ip} → stale CoreDNS cache or misconfiguration"
+                f"DNS={dns_ips}, actual={api_ip} — stale CoreDNS cache or misconfiguration"
             )
     except Exception as e:
         log(f"      WARN  Cannot read service: {e}", "WARN")
+        WARNINGS.append(f"Could not read service '{TARGET_SERVICE}': {e}")
 
-    # ── Step 3: TCP via ClusterIP ─────────────────────────────────────────────
-    if api_cluster_ip:
-        log(f"[3/4] TCP connect via ClusterIP  {api_cluster_ip}:{TARGET_PORT}")
-        clusterip_ok, elapsed, err = tcp_connect(api_cluster_ip, TARGET_PORT)
+    # Step 3 — TCP via ClusterIP (tests kube-proxy / iptables / ipvs)
+    if api_ip:
+        log(f"[3/4] ClusterIP TCP:  {api_ip}:{TARGET_PORT}  (tests kube-proxy/ipvs routing)")
+        clusterip_ok, elapsed, err = tcp_connect(api_ip, TARGET_PORT)
         if clusterip_ok:
             log(f"      OK    connected  ({elapsed:.3f}s)", "OK")
         else:
             log(f"      FAIL  {err}  ({elapsed:.3f}s)", "FAIL")
             if not dns_err:
                 IT_ISSUES.append(
-                    f"Service '{TARGET_SERVICE}': DNS resolves to {dns_ips} but "
-                    f"ClusterIP {api_cluster_ip}:{TARGET_PORT} is unreachable "
-                    f"→ kube-proxy/iptables rules not propagated"
+                    f"ClusterIP {api_ip}:{TARGET_PORT} unreachable despite DNS resolving — "
+                    "kube-proxy / iptables / ipvs rules are not propagated correctly"
                 )
             else:
                 IT_ISSUES.append(
-                    f"Service '{TARGET_SERVICE}': both DNS and ClusterIP unreachable "
-                    f"→ cluster networking is broken"
+                    f"ClusterIP {api_ip}:{TARGET_PORT} unreachable — cluster networking broken"
                 )
     else:
         clusterip_ok = False
+        log(f"[3/4] ClusterIP TCP:  skipped (ClusterIP unknown)", "INFO")
 
-    # ── Step 4: TCP direct to pod IP ─────────────────────────────────────────
-    log(f"[4/4] TCP connect directly to pod IP (bypasses DNS + kube-proxy)")
+    # Step 4 — TCP direct to pod IP (tests CNI / pod networking, bypasses everything else)
+    log(f"[4/4] Pod IP TCP:  direct to pod IP (tests CNI / pod-to-pod networking)")
     try:
         ep = v1.read_namespaced_endpoints(TARGET_SERVICE, TARGET_NAMESPACE)
-        pod_candidates = []
+        candidates = []
         for subset in (ep.subsets or []):
             ports = [p.port for p in (subset.ports or [])]
             for addr in (subset.addresses or []):
                 for port in ports:
-                    pod_candidates.append((addr.ip, port))
+                    candidates.append((addr.ip, port))
 
-        if not pod_candidates:
-            log("      WARN  No ready endpoints — cannot test pod IP", "WARN")
+        if not candidates:
+            log("      INFO  No ready endpoints — cannot test pod IP", "INFO")
+            WARNINGS.append(
+                f"No endpoints for '{TARGET_SERVICE}' — pod IP network test skipped"
+            )
         else:
-            pod_ip, pod_port = pod_candidates[0]
+            pod_ip, pod_port = candidates[0]
             pod_ok, elapsed, err = tcp_connect(pod_ip, pod_port)
             if pod_ok:
                 log(f"      OK    {pod_ip}:{pod_port}  ({elapsed:.3f}s)", "OK")
-                if not clusterip_ok and api_cluster_ip:
-                    # THE KEY FINDING: pod works, service routing doesn't
+
+                # The critical differential:
+                if not clusterip_ok and api_ip:
                     IT_ISSUES.append(
-                        f"CRITICAL: Pod IP {pod_ip}:{pod_port} is reachable but "
-                        f"ClusterIP {api_cluster_ip}:{TARGET_PORT} is not "
-                        f"→ kube-proxy is failing to set iptables/ipvs rules"
+                        f"CRITICAL — Pod IP {pod_ip}:{pod_port} reachable "
+                        f"but ClusterIP {api_ip}:{TARGET_PORT} is NOT: "
+                        "kube-proxy/iptables/ipvs rules are broken. "
+                        "This is the exact signature of a kube-proxy failure."
                     )
                 if dns_err:
                     IT_ISSUES.append(
-                        f"CRITICAL: Pod IP {pod_ip}:{pod_port} is reachable but "
-                        f"DNS for '{fqdn}' failed "
-                        f"→ CoreDNS is not working (pod networking is fine)"
+                        f"CRITICAL — Pod IP {pod_ip}:{pod_port} reachable "
+                        f"but DNS for '{fqdn}' failed: "
+                        "pod networking works but CoreDNS is not functioning. "
+                        "This is a DNS-layer infrastructure failure, not an app issue."
                     )
             else:
                 log(f"      FAIL  {pod_ip}:{pod_port}  →  {err}", "FAIL")
                 IT_ISSUES.append(
-                    f"Pod IP {pod_ip}:{pod_port} unreachable directly "
-                    f"→ CNI/pod-to-pod networking is broken"
+                    f"Pod IP {pod_ip}:{pod_port} unreachable directly — "
+                    "CNI pod-to-pod networking is broken on this node"
                 )
+
     except Exception as e:
         log(f"      WARN  Cannot test pod IPs: {e}", "WARN")
+        WARNINGS.append(f"Pod IP test skipped: {e}")
 
 
-# ─── Check 10: Recent warning events ─────────────────────────────────────────
-def check_events(k8s):
-    section(f"RECENT WARNING EVENTS  (namespace: {TARGET_NAMESPACE})")
-    v1 = k8s.CoreV1Api()
-    try:
-        events = v1.list_namespaced_event(
-            TARGET_NAMESPACE, field_selector="type=Warning"
-        ).items
-    except Exception as e:
-        log(f"Cannot read events: {e}", "WARN")
-        return
-
-    epoch = datetime.min.replace(tzinfo=timezone.utc)
-    events.sort(key=lambda e: e.last_timestamp or epoch, reverse=True)
-
-    shown = 0
-    for ev in events[:10]:
-        obj    = f"{ev.involved_object.kind}/{ev.involved_object.name}"
-        count  = ev.count or 1
-        log(f"  [{ev.last_timestamp}] {obj}: {ev.reason} ({count}x) — {ev.message}", "WARN")
-        shown += 1
-
-    if shown == 0:
-        log("  No recent warning events", "OK")
-
-
-# ─── Final verdict ────────────────────────────────────────────────────────────
+# ─── Verdict ──────────────────────────────────────────────────────────────────
 def print_verdict():
-    has_it     = bool(IT_ISSUES)
-    has_devops = bool(DEVOPS_ISSUES)
+    print(f"\n{'═'*64}", flush=True)
 
-    print(f"\n{'═'*62}", flush=True)
-
-    if has_it:
-        print("  VERDICT: ██  IT TEAM / INFRASTRUCTURE RESPONSIBILITY  ██")
-        print(f"{'═'*62}")
-        print("\n  Cluster/infrastructure issues found:\n")
+    if IT_ISSUES:
+        print("  VERDICT:  ██  IT TEAM / INFRASTRUCTURE RESPONSIBILITY  ██")
+        print(f"{'═'*64}")
+        print(f"\n  {len(IT_ISSUES)} infrastructure issue(s) found:\n")
         for i, issue in enumerate(IT_ISSUES, 1):
-            print(f"    {i:2d}. {issue}")
-        if has_devops:
-            print("\n  DevOps issues also present (resolve IT issues first):\n")
-            for i, issue in enumerate(DEVOPS_ISSUES, 1):
-                print(f"    {i:2d}. {issue}")
-    elif has_devops:
-        print("  VERDICT: ██  DEVOPS / DEPLOYMENT RESPONSIBILITY  ██")
-        print(f"{'═'*62}")
-        print("\n  Deployment/configuration issues found:\n")
-        for i, issue in enumerate(DEVOPS_ISSUES, 1):
-            print(f"    {i:2d}. {issue}")
+            # Wrap long lines
+            words = issue.split()
+            line, lines = "", []
+            for w in words:
+                if len(line) + len(w) + 1 > 70:
+                    lines.append(line)
+                    line = w
+                else:
+                    line = f"{line} {w}".strip()
+            if line:
+                lines.append(line)
+            print(f"    {i:2d}. {lines[0]}")
+            for continuation in lines[1:]:
+                print(f"        {continuation}")
+            print()
     else:
-        print("  VERDICT: ██  ALL CHECKS PASSED — NO ISSUES DETECTED  ██")
-        print(f"{'═'*62}")
-        print("\n  Cluster health and deployment health look good.")
+        print("  VERDICT:  ██  INFRASTRUCTURE IS HEALTHY  ██")
+        print(f"{'═'*64}")
+        print("\n  All cluster infrastructure checks passed.")
+        print("  If problems persist, they are in the application/deployment layer.")
 
     if WARNINGS:
-        print("\n  Informational warnings:\n")
+        print(f"\n  {'─'*60}")
+        print("  Informational / could not verify:\n")
         for w in WARNINGS:
             print(f"    ⚠  {w}")
 
-    print(f"\n{'═'*62}\n", flush=True)
-    return 1 if (has_it or has_devops) else 0
+    print(f"\n{'═'*64}\n", flush=True)
+    return 1 if IT_ISSUES else 0
 
 
-# ─── Entry point ──────────────────────────────────────────────────────────────
+# ─── Main ─────────────────────────────────────────────────────────────────────
 def main():
-    print("╔══════════════════════════════════════════════════════════╗")
-    print("║        k8s-diagnostics  —  Cluster Issue Classifier     ║")
-    print("║   Determines: IT Team (infra) vs DevOps (deployment)    ║")
-    print("╚══════════════════════════════════════════════════════════╝")
-    print(f"\n  target namespace  : {TARGET_NAMESPACE}")
-    print(f"  target service    : {TARGET_SERVICE or '(none — set TARGET_SERVICE to deep-test)'}")
-    print(f"  cluster domain    : {CLUSTER_DOMAIN}")
+    print("╔══════════════════════════════════════════════════════════════╗")
+    print("║       k8s-diagnostics — Cluster Infrastructure Checker      ║")
+    print("║  Checks cluster components only. No app workloads touched.  ║")
+    print("╚══════════════════════════════════════════════════════════════╝")
+    print(f"\n  cluster domain    : {CLUSTER_DOMAIN}")
     print(f"  DNS slow threshold: {DNS_SLOW_THRESHOLD}s")
-    print(f"  connect timeout   : {CONNECT_TIMEOUT}s\n")
+    print(f"  DNS timeout       : {DNS_TIMEOUT}s")
+    print(f"  connect timeout   : {CONNECT_TIMEOUT}s")
+    if TARGET_SERVICE:
+        print(f"  network path test : {TARGET_SERVICE}.{TARGET_NAMESPACE}:{TARGET_PORT}")
+    else:
+        print("  network path test : disabled (set TARGET_SERVICE to enable)")
 
     check_resolv_conf()
     check_cluster_dns()
@@ -641,14 +658,13 @@ def main():
     k8s = init_k8s()
     if k8s:
         check_coredns(k8s)
-        check_network_components(k8s)
+        check_kube_proxy(k8s)
+        check_cni(k8s)
         check_nodes(k8s)
-        check_deployments(k8s)
-        check_services_and_endpoints(k8s)
-        check_resource_quotas(k8s)
+        check_system_pods(k8s)
+        check_apiserver(k8s)
         if TARGET_SERVICE:
-            check_target_service(k8s)
-        check_events(k8s)
+            check_service_network_path(k8s)
 
     sys.exit(print_verdict())
 

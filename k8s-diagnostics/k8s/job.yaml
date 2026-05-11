@@ -2,28 +2,32 @@
 # ──────────────────────────────────────────────────────────────────────────────
 # k8s-diagnostics Job
 #
-# Mandatory env vars:
-#   TARGET_NAMESPACE   — namespace where your Helm release is deployed
+# Checks CLUSTER INFRASTRUCTURE ONLY. No application workloads are inspected.
+# Verdict is always: "IT TEAM RESPONSIBILITY" or "INFRASTRUCTURE IS HEALTHY".
 #
 # Optional env vars:
-#   TARGET_SERVICE     — service name to deep-test (DNS vs ClusterIP vs pod IP)
-#   TARGET_PORT        — port to TCP-connect on for the service deep-test (default: 80)
+#   TARGET_SERVICE     — (optional) service name to run a network path test on.
+#                        This tests DNS → ClusterIP TCP → Pod IP TCP to locate
+#                        exactly where in the network stack the failure is.
+#                        It does NOT check whether the application is healthy.
+#   TARGET_NAMESPACE   — namespace of TARGET_SERVICE (default: default)
+#   TARGET_PORT        — port for the TCP probe (default: 80)
 #   CLUSTER_DOMAIN     — cluster DNS domain (default: cluster.local)
 #   DNS_SLOW_THRESHOLD — seconds above which DNS is flagged as slow (default: 0.5)
-#   DNS_TIMEOUT        — hard timeout for each DNS query (default: 3.0)
+#   DNS_TIMEOUT        — hard timeout per DNS query (default: 3.0)
 #   CONNECT_TIMEOUT    — hard timeout for TCP connect probes (default: 3.0)
 #
 # Usage:
-#   # 1. Apply RBAC once:
+#   # 1. Apply RBAC once per cluster:
 #   kubectl apply -f rbac.yaml
 #
-#   # 2. Edit TARGET_NAMESPACE (and optionally TARGET_SERVICE) below, then:
+#   # 2. Apply the job (edit env vars below as needed):
 #   kubectl apply -f job.yaml
 #
-#   # 3. Watch results:
+#   # 3. Watch the output:
 #   kubectl logs -n kube-system -l job-name=k8s-diagnostics -f
 #
-#   # 4. Re-run: delete the job and apply again
+#   # 4. Re-run (delete and re-apply):
 #   kubectl delete job k8s-diagnostics -n kube-system && kubectl apply -f job.yaml
 # ──────────────────────────────────────────────────────────────────────────────
 apiVersion: batch/v1
@@ -62,21 +66,21 @@ spec:
           imagePullPolicy: IfNotPresent
 
           env:
-            # ── REQUIRED ──────────────────────────────────────────────────────
-            - name: TARGET_NAMESPACE
-              value: "default"         # ← change to your Helm release namespace
-
-            # ── OPTIONAL: uncomment + set to run the service deep-test ────────
+            # ── OPTIONAL: network path test ───────────────────────────────────
+            # Uncomment to test DNS → ClusterIP → Pod IP for a specific service.
+            # This tests the NETWORK INFRASTRUCTURE PATH only (not the app).
             # - name: TARGET_SERVICE
-            #   value: "my-app"        # ← your service name (no namespace, no domain)
+            #   value: "my-app"        # ← service name (no namespace, no domain suffix)
+            # - name: TARGET_NAMESPACE
+            #   value: "default"       # ← namespace of that service
             # - name: TARGET_PORT
-            #   value: "8080"
+            #   value: "8080"          # ← port to TCP-probe
 
             # ── OPTIONAL: tuning ──────────────────────────────────────────────
             # - name: CLUSTER_DOMAIN
             #   value: "cluster.local"
             # - name: DNS_SLOW_THRESHOLD
-            #   value: "0.5"
+            #   value: "0.5"           # flag DNS as slow above this many seconds
             # - name: DNS_TIMEOUT
             #   value: "3.0"
             # - name: CONNECT_TIMEOUT
