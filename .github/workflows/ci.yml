@@ -71,19 +71,10 @@ jobs:
           cache-to: type=gha,mode=max
 
       # ── Integration test ─────────────────────────────────────────────────────
-      - name: Install kind, kubectl, helm
-        # install_only:true installs the tools without creating a cluster,
-        # so we can delete any stale cluster ourselves before creating a fresh one.
+      - name: Create kind cluster
         uses: helm/kind-action@v1
         with:
-          install_only: true
-
-      - name: Create fresh kind cluster
-        # Delete any cluster left over from a previous run on this runner VM,
-        # then create a brand-new one. Guarantees zero shared state.
-        run: |
-          kind delete cluster --name kind 2>/dev/null || true
-          kind create cluster --name kind --wait 90s
+          cluster_name: kind
 
       - name: Wait for CoreDNS to be ready
         run: |
@@ -94,18 +85,19 @@ jobs:
       - name: Load image into kind
         run: kind load docker-image ${{ env.CI_IMAGE }} --name kind
 
-      - name: Install devnopes via Helm
-        # Helm creates the ServiceAccount, ClusterRole, ClusterRoleBinding, and Job.
-        # pullPolicy=Never — image was loaded locally above, do not pull from registry.
-        # cniConfMount.enabled=false — kind nodes are containers; no real /etc/cni/net.d.
-        #   The tool falls back to CRD/pod detection automatically.
+      - name: Deploy devnopes
+        # helm template | kubectl apply is fully idempotent: it never fails on
+        # pre-existing resources regardless of who created them or cluster state.
+        # Delete the Job first because Job specs are immutable once created.
         run: |
-          helm upgrade --install devnopes ./helm \
-            -n kube-system \
+          kubectl delete job devnopes -n kube-system --ignore-not-found=true
+          helm template devnopes ./helm \
+            --namespace kube-system \
             --set image.repository=devnopes \
             --set image.tag=ci-test \
             --set image.pullPolicy=Never \
-            --set cniConfMount.enabled=false
+            --set cniConfMount.enabled=false \
+          | kubectl apply -f -
 
       - name: Wait for job to complete
         run: |
