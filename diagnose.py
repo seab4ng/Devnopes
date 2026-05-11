@@ -103,6 +103,24 @@ def tcp_connect(host, port, timeout=None):
         return False, time.monotonic() - start, str(e)
 
 
+def _resolve_with_retry(hostname, timeout=None):
+    """Resolve once; if failed or slow, wait 1s and try once more. Returns final result."""
+    ips, elapsed, err = resolve_with_timing(hostname, timeout)
+    if err or elapsed > DNS_SLOW_THRESHOLD:
+        time.sleep(1.0)
+        return resolve_with_timing(hostname, timeout)
+    return ips, elapsed, err
+
+
+def _tcp_with_retry(host, port, timeout=None):
+    """Connect once; if failed, wait 1s and try once more. Returns final result."""
+    ok, elapsed, err = tcp_connect(host, port, timeout)
+    if not ok:
+        time.sleep(1.0)
+        return tcp_connect(host, port, timeout)
+    return ok, elapsed, err
+
+
 # ─── K8s client ───────────────────────────────────────────────────────────────
 def init_k8s():
     try:
@@ -206,7 +224,7 @@ def check_cluster_dns():
     ]
 
     for name, description in probes:
-        ips, elapsed, err = resolve_with_timing(name)
+        ips, elapsed, err = _resolve_with_retry(name)
         if err:
             log(f"FAIL  {name}", "FAIL")
             log(f"      ({description})", "INFO")
@@ -265,15 +283,20 @@ def check_coredns(k8s):
     v1 = k8s.CoreV1Api()
 
     pods = []
-    for selector in (
-        "k8s-app=kube-dns",
-        "app=coredns",
-        "app.kubernetes.io/name=coredns",
-        "k8s-app=coredns",
-    ):
-        pods = v1.list_namespaced_pod("kube-system", label_selector=selector).items
-        if pods:
-            break
+    try:
+        for selector in (
+            "k8s-app=kube-dns",
+            "app=coredns",
+            "app.kubernetes.io/name=coredns",
+            "k8s-app=coredns",
+        ):
+            pods = v1.list_namespaced_pod("kube-system", label_selector=selector).items
+            if pods:
+                break
+    except Exception as e:
+        log(f"WARN  Cannot list CoreDNS pods: {e}", "WARN")
+        WARNINGS.append(f"Could not list CoreDNS pods — API call failed: {e}")
+        return
 
     if not pods:
         log("No CoreDNS/kube-dns pods found in kube-system", "FAIL")
@@ -453,6 +476,7 @@ _CNI_POD_LABELS = [
     ("app=ovs-cni-amd64",                       "OVS-CNI"),
     ("app=ovn-kubernetes-node",                 "OVN-Kubernetes"),
     ("app=kube-router",                         "kube-router"),
+    ("app=kindnet",                             "kindnet"),
 ]
 
 
@@ -653,7 +677,13 @@ def check_nodes(k8s):
     section("NODE CONDITIONS")
     v1 = k8s.CoreV1Api()
 
-    nodes = v1.list_node().items
+    try:
+        nodes = v1.list_node().items
+    except Exception as e:
+        log(f"WARN  Cannot list nodes: {e}", "WARN")
+        WARNINGS.append(f"Could not list nodes — API call failed: {e}")
+        return
+
     if not nodes:
         log("No nodes returned from API", "FAIL")
         IT_ISSUES.append("No nodes found — API server may be degraded")
@@ -707,7 +737,13 @@ def check_system_pods(k8s):
         "kube-dns",
     )
 
-    all_pods = v1.list_namespaced_pod("kube-system").items
+    try:
+        all_pods = v1.list_namespaced_pod("kube-system").items
+    except Exception as e:
+        log(f"WARN  Cannot list kube-system pods: {e}", "WARN")
+        WARNINGS.append(f"Could not list kube-system pods — API call failed: {e}")
+        return
+
     infra_pods = [
         p for p in all_pods
         if any(p.metadata.name.startswith(prefix) for prefix in infra_prefixes)
@@ -758,13 +794,13 @@ def check_apiserver(k8s):
         svc = v1.read_namespaced_service("kubernetes", "default")
         api_ip   = svc.spec.cluster_ip
         api_port = next(
-            (p.port for p in svc.spec.ports if p.name in ("https", "443")),
+            (p.port for p in svc.spec.ports if p.name == "https"),
             443
         )
         log(f"INFO  API server ClusterIP: {api_ip}:{api_port}", "INFO")
 
         # DNS resolution
-        ips, elapsed, err = resolve_with_timing(f"kubernetes.default.svc.{CLUSTER_DOMAIN}")
+        ips, elapsed, err = _resolve_with_retry(f"kubernetes.default.svc.{CLUSTER_DOMAIN}")
         if err:
             log(f"FAIL  DNS for kubernetes service: {err}", "FAIL")
             IT_ISSUES.append(f"Cannot resolve kubernetes API service DNS: {err}")
@@ -775,7 +811,7 @@ def check_apiserver(k8s):
             log(f"OK    kubernetes service DNS: {ips}  ({elapsed:.3f}s)", "OK")
 
         # TCP reachability
-        ok, elapsed, err = tcp_connect(api_ip, api_port)
+        ok, elapsed, err = _tcp_with_retry(api_ip, api_port)
         if ok:
             log(f"OK    TCP connect to API server {api_ip}:{api_port}  ({elapsed:.3f}s)", "OK")
         else:
@@ -807,7 +843,7 @@ def check_service_network_path(k8s):
 
     # Step 1 — DNS
     log(f"[1/4] DNS:        {fqdn}")
-    dns_ips, dns_elapsed, dns_err = resolve_with_timing(fqdn)
+    dns_ips, dns_elapsed, dns_err = _resolve_with_retry(fqdn)
 
     if dns_err:
         log(f"      FAIL  {dns_err}  ({dns_elapsed:.3f}s)", "FAIL")
