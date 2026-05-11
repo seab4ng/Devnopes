@@ -56,28 +56,9 @@ jobs:
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
 
-      # Login only on tag pushes — image is only pushed on releases
-      - name: Login to Docker Hub
-        if: startsWith(github.ref, 'refs/tags/')
-        uses: docker/login-action@v3
-        with:
-          username: ${{ secrets.DOCKERHUB_USERNAME }}
-          password: ${{ secrets.DOCKERHUB_TOKEN }}
-
-      - name: Extract image metadata
-        id: meta
-        uses: docker/metadata-action@v5
-        with:
-          images: ${{ env.IMAGE_NAME }}
-          tags: |
-            # Use the git tag name as-is (e.g. v1.0.0 → v1.0.0)
-            type=ref,event=tag
-            # latest always points to the most recent release tag
-            type=raw,value=latest,enable=${{ startsWith(github.ref, 'refs/tags/') }}
-
-      - name: Build image
-        # Runs on every push to main — build check only, no push
-        if: "!startsWith(github.ref, 'refs/tags/')"
+      - name: Build image (load into local daemon)
+        # Always built and loaded locally — used by the integration test below.
+        # On tag pushes this same image is tagged and pushed to Docker Hub.
         uses: docker/build-push-action@v6
         with:
           context: .
@@ -90,6 +71,8 @@ jobs:
       # ── Integration test ─────────────────────────────────────────────────────
       - name: Create kind cluster
         uses: helm/kind-action@v1
+        with:
+          cluster_name: kind
 
       - name: Wait for CoreDNS to be ready
         run: |
