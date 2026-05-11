@@ -1,0 +1,77 @@
+# ── Image ─────────────────────────────────────────────────────────────────────
+image:
+  # In airgap environments, replace with your internal registry:
+  #   repository: registry.internal.corp/tools/devnopes
+  repository: your-dockerhub-username/devnopes
+  tag: latest
+  pullPolicy: IfNotPresent
+
+# ── Core cluster config ────────────────────────────────────────────────────────
+config:
+  # DNS domain of the cluster. Change if your cluster uses a custom domain.
+  clusterDomain: cluster.local
+
+  # DNS resolution time (seconds) above which CoreDNS is flagged as slow.
+  dnsSlowThreshold: "0.5"
+
+  # Hard timeout (seconds) for each DNS query attempt.
+  dnsTimeout: "3.0"
+
+  # Hard timeout (seconds) for TCP connect probes.
+  connectTimeout: "3.0"
+
+  # How far back (seconds) to scan CoreDNS and kube-proxy logs for errors.
+  # Only the last N seconds are read — older entries are ignored.
+  # Default: 300 = last 5 minutes.
+  logScanSeconds: "300"
+
+# ── Optional: service network path test ───────────────────────────────────────
+# When enabled, the tool runs a 4-step test on a specific service:
+#   Step 1 — DNS resolution timing
+#   Step 2 — Ground-truth ClusterIP from K8s API
+#   Step 3 — TCP connect to ClusterIP (tests kube-proxy / iptables)
+#   Step 4 — TCP connect directly to pod IP (tests CNI)
+# This is a NETWORK INFRASTRUCTURE test — it does not check the application.
+networkPathTest:
+  enabled: false
+  service: ""        # service name only, e.g. "my-app"
+  namespace: default # namespace the service lives in
+  port: 80           # port to TCP-probe
+
+# ── CNI config mount ──────────────────────────────────────────────────────────
+# Mounts /etc/cni/net.d from the host node so the tool can read the CNI config
+# file directly — the most reliable way to identify which CNI is installed.
+# Disable if your security policy prohibits hostPath volumes; the tool will
+# fall back to CRD-based and pod-label-based CNI detection automatically.
+cniConfMount:
+  enabled: true
+  hostPath: /etc/cni/net.d
+
+# ── Job settings ──────────────────────────────────────────────────────────────
+job:
+  # Namespace to run the Job in. kube-system is recommended so the Job can
+  # easily reach all cluster components.
+  namespace: kube-system
+
+  # Auto-delete the Job this many seconds after completion (0 = keep forever).
+  # Remove this field if your cluster does not support TTL for Jobs.
+  ttlSecondsAfterFinished: 3600
+
+  # Allow the Job to run on control-plane nodes (recommended — gives the best
+  # view of cluster internals). Remove if your policy prohibits this.
+  tolerations:
+    - key: node-role.kubernetes.io/control-plane
+      operator: Exists
+      effect: NoSchedule
+    - key: node-role.kubernetes.io/master
+      operator: Exists
+      effect: NoSchedule
+
+# ── Resource limits ───────────────────────────────────────────────────────────
+resources:
+  requests:
+    cpu: 50m
+    memory: 64Mi
+  limits:
+    cpu: 200m
+    memory: 128Mi

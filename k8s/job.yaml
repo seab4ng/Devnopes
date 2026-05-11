@@ -1,0 +1,120 @@
+---
+# ──────────────────────────────────────────────────────────────────────────────
+# devnopes Job
+#
+# Checks CLUSTER INFRASTRUCTURE ONLY. No application workloads are inspected.
+# Verdict is always: "IT TEAM RESPONSIBILITY" or "INFRASTRUCTURE IS HEALTHY".
+#
+# Optional env vars:
+#   TARGET_SERVICE     — (optional) service name to run a network path test on.
+#                        This tests DNS → ClusterIP TCP → Pod IP TCP to locate
+#                        exactly where in the network stack the failure is.
+#                        It does NOT check whether the application is healthy.
+#   TARGET_NAMESPACE   — namespace of TARGET_SERVICE (default: default)
+#   TARGET_PORT        — port for the TCP probe (default: 80)
+#   CLUSTER_DOMAIN     — cluster DNS domain (default: cluster.local)
+#   DNS_SLOW_THRESHOLD — seconds above which DNS is flagged as slow (default: 0.5)
+#   DNS_TIMEOUT        — hard timeout per DNS query (default: 3.0)
+#   CONNECT_TIMEOUT    — hard timeout for TCP connect probes (default: 3.0)
+#
+# Usage:
+#   # 1. Apply RBAC once per cluster:
+#   kubectl apply -f rbac.yaml
+#
+#   # 2. Apply the job (edit env vars below as needed):
+#   kubectl apply -f job.yaml
+#
+#   # 3. Watch the output:
+#   kubectl logs -n kube-system -l job-name=devnopes -f
+#
+#   # 4. Re-run (delete and re-apply):
+#   kubectl delete job devnopes -n kube-system && kubectl apply -f job.yaml
+# ──────────────────────────────────────────────────────────────────────────────
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: devnopes
+  namespace: kube-system
+  labels:
+    app: devnopes
+spec:
+  ttlSecondsAfterFinished: 3600   # auto-clean after 1 hour; remove line if not supported
+  backoffLimit: 0                 # do not retry on failure — one clear run is enough
+  template:
+    metadata:
+      labels:
+        app: devnopes
+    spec:
+      serviceAccountName: devnopes
+      restartPolicy: Never
+
+      # Run on a control-plane node if possible so we can reach kube-system easily;
+      # remove the tolerations block if your cluster restricts this.
+      tolerations:
+        - key: node-role.kubernetes.io/control-plane
+          operator: Exists
+          effect: NoSchedule
+        - key: node-role.kubernetes.io/master
+          operator: Exists
+          effect: NoSchedule
+
+      # Mount the host's CNI config directory so the tool can read CNI type directly.
+      # This is the most reliable CNI detection method (Layer 1).
+      # Remove this volume if your security policy prohibits hostPath mounts —
+      # the tool will fall back to CRD-based (Layer 2) and pod-label (Layer 3) detection.
+      volumes:
+        - name: cni-conf
+          hostPath:
+            path: /etc/cni/net.d
+            type: DirectoryOrCreate
+
+      containers:
+        - name: diagnostics
+          # Replace with your internal registry path in airgap environments, e.g.:
+          #   registry.internal.corp/tools/devnopes:latest
+          image: ghcr.io/seab4ng/devnopes/devnopes:latest
+          imagePullPolicy: IfNotPresent
+
+          volumeMounts:
+            - name: cni-conf
+              mountPath: /host/etc/cni/net.d
+              readOnly: true
+
+          env:
+            # ── OPTIONAL: network path test ───────────────────────────────────
+            # Uncomment to test DNS → ClusterIP → Pod IP for a specific service.
+            # This tests the NETWORK INFRASTRUCTURE PATH only (not the app).
+            # - name: TARGET_SERVICE
+            #   value: "my-app"        # ← service name (no namespace, no domain suffix)
+            # - name: TARGET_NAMESPACE
+            #   value: "default"       # ← namespace of that service
+            # - name: TARGET_PORT
+            #   value: "8080"          # ← port to TCP-probe
+
+            # ── OPTIONAL: tuning ──────────────────────────────────────────────
+            # - name: CLUSTER_DOMAIN
+            #   value: "cluster.local"
+            # - name: DNS_SLOW_THRESHOLD
+            #   value: "0.5"           # flag DNS as slow above this many seconds
+            # - name: DNS_TIMEOUT
+            #   value: "3.0"
+            # - name: CONNECT_TIMEOUT
+            #   value: "3.0"
+            # - name: LOG_SCAN_SECONDS
+            #   value: "300"           # how far back to look in CoreDNS/kube-proxy logs (default: 5 min)
+
+          resources:
+            requests:
+              cpu: "50m"
+              memory: "64Mi"
+            limits:
+              cpu: "200m"
+              memory: "128Mi"
+
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            runAsNonRoot: true
+            runAsUser: 1000
+            capabilities:
+              drop: ["ALL"]

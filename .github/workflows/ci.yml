@@ -1,0 +1,101 @@
+name: CI — Build and Push
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "diagnose.py"
+      - "Dockerfile"
+      - "pyproject.toml"
+      - "uv.lock"
+      - ".github/workflows/ci.yml"
+    tags:
+      - "v*"       # e.g. v1.0.0 — triggers a release build and push
+
+# Required GitHub secrets:
+#   DOCKERHUB_USERNAME  — your Docker Hub username
+#   DOCKERHUB_TOKEN     — Docker Hub access token
+#                         (Docker Hub → Account Settings → Security → New Access Token)
+#
+# Image is pushed to:  <DOCKERHUB_USERNAME>/devnopes
+
+env:
+  IMAGE_NAME: ${{ secrets.DOCKERHUB_USERNAME }}/devnopes
+
+jobs:
+  build-and-push:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # ── Python dependency management via uv ──────────────────────────────────
+      # uv is a fast Python package manager (written in Rust).
+      # It generates uv.lock (the lockfile) and installs from it.
+      # This step runs in CI — NOT inside the Docker container at runtime.
+      - name: Install uv
+        uses: astral-sh/setup-uv@v4
+        with:
+          version: "0.5.4"
+          enable-cache: true
+          cache-dependency-glob: "uv.lock"
+
+      - name: Generate / verify lockfile
+        # uv lock is idempotent: no-op if pyproject.toml hasn't changed.
+        # Generates uv.lock on first run; verifies it on subsequent runs.
+        # The generated uv.lock is available in the workspace for Docker COPY.
+        run: uv lock
+
+      - name: Install dependencies (CI verification)
+        # Installs exactly the versions pinned in uv.lock — no surprises.
+        # This step also serves as a smoke-test that the lockfile is valid.
+        run: uv sync --frozen --no-dev
+
+      # ── Docker ───────────────────────────────────────────────────────────────
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      # Login only on tag pushes — image is only pushed on releases
+      - name: Login to Docker Hub
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Extract image metadata
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.IMAGE_NAME }}
+          tags: |
+            # Semver tags from the git tag (e.g. v1.2.3 → 1.2.3, 1.2, 1)
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+            type=semver,pattern={{major}}
+            # latest always points to the most recent release tag
+            type=raw,value=latest,enable=${{ startsWith(github.ref, 'refs/tags/') }}
+
+      - name: Build image
+        # Runs on every push to main — build check only, no push
+        if: "!startsWith(github.ref, 'refs/tags/')"
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: false
+          tags: ${{ env.IMAGE_NAME }}:build-check
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Build and push release image
+        # Runs only on tag push — the only step that pushes to Docker Hub
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max

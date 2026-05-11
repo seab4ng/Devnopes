@@ -1,0 +1,15 @@
+apiVersion: v2
+name: devnopes
+description: >
+  Kubernetes cluster infrastructure health checker.
+  Runs as a Job and determines whether problems are IT Team (cluster/infra)
+  or DevOps (deployment) responsibility. Designed for airgap environments.
+type: application
+version: 0.1.0
+appVersion: "0.1.0"
+keywords:
+  - diagnostics
+  - networking
+  - dns
+  - airgap
+  - troubleshooting

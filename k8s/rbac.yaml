@@ -1,0 +1,56 @@
+---
+# ServiceAccount the Job will run as
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: devnopes
+  namespace: kube-system   # run from kube-system so it can read everything cleanly
+
+---
+# Read-only access to cluster-wide resources (nodes, pods, services, etc.)
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: devnopes
+rules:
+  - apiGroups: [""]
+    resources:
+      - nodes
+      - pods
+      - services
+      - endpoints
+      - events
+      - namespaces
+      - resourcequotas
+    verbs: ["get", "list"]
+  # needed to scan CoreDNS and kube-proxy logs for function-specific errors
+  - apiGroups: [""]
+    resources:
+      - pods/log
+    verbs: ["get"]
+  - apiGroups: ["apps"]
+    resources:
+      - deployments
+      - daemonsets
+      - replicasets
+      - statefulsets
+    verbs: ["get", "list"]
+  # needed for Layer 2 CNI detection (CRD group name matching)
+  - apiGroups: ["apiextensions.k8s.io"]
+    resources:
+      - customresourcedefinitions
+    verbs: ["get", "list"]
+
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: devnopes
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: devnopes
+subjects:
+  - kind: ServiceAccount
+    name: devnopes
+    namespace: kube-system
