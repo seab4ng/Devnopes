@@ -1,4 +1,4 @@
-name: CI — Build and Push
+name: CI — Build, Test and Push
 
 on:
   push:
@@ -17,13 +17,14 @@ on:
 #   DOCKERHUB_TOKEN     — Docker Hub access token
 #                         (Docker Hub → Account Settings → Security → New Access Token)
 #
-# Image is pushed to:  <DOCKERHUB_USERNAME>/devnopes
+# Image is pushed to:  <DOCKERHUB_USERNAME>/devnopes:<tag>  and  :latest
 
 env:
   IMAGE_NAME: ${{ secrets.DOCKERHUB_USERNAME }}/devnopes
+  CI_IMAGE: devnopes:ci-test
 
 jobs:
-  build-and-push:
+  build-test-push:
     runs-on: ubuntu-latest
 
     steps:
@@ -44,15 +45,14 @@ jobs:
       - name: Generate / verify lockfile
         # uv lock is idempotent: no-op if pyproject.toml hasn't changed.
         # Generates uv.lock on first run; verifies it on subsequent runs.
-        # The generated uv.lock is available in the workspace for Docker COPY.
         run: uv lock
 
       - name: Install dependencies (CI verification)
         # Installs exactly the versions pinned in uv.lock — no surprises.
-        # This step also serves as a smoke-test that the lockfile is valid.
+        # This also smoke-tests that the lockfile is valid.
         run: uv sync --frozen --no-dev
 
-      # ── Docker ───────────────────────────────────────────────────────────────
+      # ── Docker: build ────────────────────────────────────────────────────────
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
 
@@ -82,18 +82,69 @@ jobs:
         with:
           context: .
           push: false
-          tags: ${{ env.IMAGE_NAME }}:build-check
+          load: true
+          tags: ${{ env.CI_IMAGE }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
 
-      - name: Build and push release image
-        # Runs only on tag push — the only step that pushes to Docker Hub
+      # ── Integration test ─────────────────────────────────────────────────────
+      - name: Create kind cluster
+        uses: helm/kind-action@v1
+
+      - name: Wait for CoreDNS to be ready
+        run: |
+          kubectl -n kube-system wait \
+            --for=condition=available deployment/coredns \
+            --timeout=90s
+
+      - name: Load image into kind
+        run: kind load docker-image ${{ env.CI_IMAGE }}
+
+      - name: Apply RBAC
+        run: kubectl apply -f k8s/rbac.yaml
+
+      - name: Install devnopes via Helm
+        # pullPolicy=Never — image was loaded locally above, do not pull from registry.
+        # cniConfMount.enabled=false — kind nodes are containers; no real /etc/cni/net.d.
+        #   The tool falls back to CRD/pod detection automatically.
+        run: |
+          helm install devnopes ./helm \
+            -n kube-system \
+            --set image.repository=devnopes \
+            --set image.tag=ci-test \
+            --set image.pullPolicy=Never \
+            --set cniConfMount.enabled=false
+
+      - name: Wait for job to complete
+        run: |
+          kubectl wait -n kube-system \
+            --for=condition=complete \
+            job/devnopes \
+            --timeout=120s
+
+      - name: Show full job output
+        if: always()
+        run: kubectl logs -n kube-system -l job-name=devnopes --tail=200
+
+      - name: Assert healthy verdict
+        run: |
+          kubectl logs -n kube-system -l job-name=devnopes \
+            | grep "INFRASTRUCTURE IS HEALTHY"
+
+      # ── Docker: push (tag releases only) ─────────────────────────────────────
+      - name: Login to Docker Hub
         if: startsWith(github.ref, 'refs/tags/')
-        uses: docker/build-push-action@v6
+        uses: docker/login-action@v3
         with:
-          context: .
-          push: true
-          tags: ${{ steps.meta.outputs.tags }}
-          labels: ${{ steps.meta.outputs.labels }}
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Tag and push release image
+        # Uses the image already built and tested above.
+        # github.ref_name on a tag push is the tag name verbatim (e.g. v1.0.0).
+        if: startsWith(github.ref, 'refs/tags/')
+        run: |
+          docker tag ${{ env.CI_IMAGE }} ${{ env.IMAGE_NAME }}:${{ github.ref_name }}
+          docker tag ${{ env.CI_IMAGE }} ${{ env.IMAGE_NAME }}:latest
+          docker push ${{ env.IMAGE_NAME }}:${{ github.ref_name }}
+          docker push ${{ env.IMAGE_NAME }}:latest
