@@ -110,14 +110,11 @@ jobs:
             --for=condition=failed \
             --timeout=10s
 
-      - name: Show full job output
-        if: always()
-        run: kubectl logs -n kube-system -l job-name=devnopes --tail=200
-
-      - name: Assert healthy verdict
+      - name: Show output and assert healthy verdict
         run: |
-          kubectl logs -n kube-system -l job-name=devnopes \
-            | grep "INFRASTRUCTURE IS HEALTHY"
+          LOGS=$(kubectl logs -n kube-system -l job-name=devnopes --tail=200)
+          echo "$LOGS"
+          echo "$LOGS" | grep "INFRASTRUCTURE IS HEALTHY"
 
       # ── Docker: push (tag releases only) ─────────────────────────────────────
       - name: Login to Docker Hub
