@@ -99,12 +99,16 @@ jobs:
             --set cniConfMount.enabled=false \
           | kubectl apply -f -
 
-      - name: Wait for job to complete
+      - name: Wait for job to finish
+        # Wait for Complete OR Failed — the job exits non-zero when infra issues
+        # are found, which sets condition=failed not condition=complete.
         run: |
-          kubectl wait -n kube-system \
+          kubectl wait -n kube-system job/devnopes \
             --for=condition=complete \
-            job/devnopes \
-            --timeout=120s
+            --timeout=120s \
+          || kubectl wait -n kube-system job/devnopes \
+            --for=condition=failed \
+            --timeout=10s
 
       - name: Show full job output
         if: always()
