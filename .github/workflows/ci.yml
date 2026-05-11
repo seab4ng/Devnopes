@@ -29,11 +29,15 @@ jobs:
   build-test-push:
     runs-on: ubuntu-latest
 
+    permissions:
+      contents: read
+      security-events: write   # required to upload Trivy SARIF to GitHub Security tab
+
     steps:
       - name: Checkout
         uses: actions/checkout@v4
 
-      # ── Python dependency management via uv ──────────────────────────────────
+      # ── Python dependency management via uv ──────────────────────────────────────────
       # uv is a fast Python package manager (written in Rust).
       # It generates uv.lock (the lockfile) and installs from it.
       # This step runs in CI — NOT inside the Docker container at runtime.
@@ -54,7 +58,7 @@ jobs:
         # This also smoke-tests that the lockfile is valid.
         run: uv sync --frozen --no-dev
 
-      # ── Docker: build ────────────────────────────────────────────────────────
+      # ── Docker: build ─────────────────────────────────────────────────────────
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
 
@@ -70,7 +74,23 @@ jobs:
           cache-from: type=gha
           cache-to: type=gha,mode=max
 
-      # ── Integration test ─────────────────────────────────────────────────────
+      # ── Security: vulnerability scan ──────────────────────────────────────────
+      - name: Scan image for vulnerabilities (Trivy)
+        uses: aquasecurity/trivy-action@0.28.0
+        with:
+          image-ref: ${{ env.CI_IMAGE }}
+          format: sarif
+          output: trivy-results.sarif
+          severity: CRITICAL,HIGH
+          exit-code: "0"          # never fail the build — report only
+
+      - name: Upload Trivy results to GitHub Security tab
+        uses: github/codeql-action/upload-sarif@v3
+        if: always()
+        with:
+          sarif_file: trivy-results.sarif
+
+      # ── Integration test ───────────────────────────────────────────────────────────
       - name: Create kind cluster
         uses: helm/kind-action@v1
         with:
@@ -116,7 +136,7 @@ jobs:
           echo "$LOGS"
           echo "$LOGS" | grep "INFRASTRUCTURE IS HEALTHY"
 
-      # ── Docker: push (tag releases only) ─────────────────────────────────────
+      # ── Docker: push (tag releases only) ─────────────────────────────────────────────
       - name: Login to Docker Hub
         if: startsWith(github.ref, 'refs/tags/')
         uses: docker/login-action@v3

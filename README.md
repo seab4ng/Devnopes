@@ -31,6 +31,29 @@ Designed for **airgap environments**. The running container needs zero internet 
 
 ---
 
+## Viewing results
+
+```bash
+# Stream live while the job runs
+kubectl logs -n kube-system job/devnopes --follow
+
+# Read after it completes
+kubectl logs -n kube-system job/devnopes
+
+# Also works by label
+kubectl logs -n kube-system -l job-name=devnopes
+
+# Check the job exit code (Complete = healthy, Failed = issues found)
+kubectl get job devnopes -n kube-system
+```
+
+The job exits **0** (`condition=Complete`) when infrastructure is healthy, **1** (`condition=Failed`) when issues are found. The full verdict and issue list are always printed in the logs before exit.
+
+In **k9s**: navigate to Jobs → `devnopes` → press `l` for logs.  
+In **Lens / OpenLens**: Workloads → Jobs → `devnopes` → Logs tab.
+
+---
+
 ## Airgap usage
 
 The image is built in CI (which has internet) and pushed to Docker Hub. In airgap, you mirror it to your internal registry — the running container needs no outbound connectivity.
@@ -141,6 +164,26 @@ The combination of results pinpoints the failure layer:
 
 ---
 
+## Security
+
+### Vulnerability scanning
+
+Every CI run scans the built Docker image with **[Trivy](https://github.com/aquasecurity/trivy)** (CRITICAL and HIGH severity). Results are uploaded to the **[GitHub Security tab → Code scanning](../../security/code-scanning)** as SARIF — no extra tools needed, just open the tab in GitHub.
+
+The scan runs on every push to `main` and on every release tag. It never blocks the build — it reports only, so you can review and decide what to patch.
+
+### Container security posture
+
+The container is hardened by default:
+
+- Runs as non-root (`runAsUser: 1000`, `runAsNonRoot: true`)
+- Read-only root filesystem (`readOnlyRootFilesystem: true`)
+- All Linux capabilities dropped (`capabilities.drop: ["ALL"]`)
+- No privilege escalation (`allowPrivilegeEscalation: false`)
+- Read-only RBAC only — no write permissions to any cluster resource
+
+---
+
 ## CI — GitHub Actions
 
 The pipeline (`.github/workflows/ci.yml`) does:
@@ -149,7 +192,9 @@ The pipeline (`.github/workflows/ci.yml`) does:
 2. Runs `uv lock` — generates/verifies `uv.lock` (the dependency lockfile)
 3. Runs `uv sync --frozen --no-dev` — installs deps in CI for verification
 4. Builds the Docker image (multi-stage; all packages baked in at build time)
-5. Pushes to Docker Hub **only on version tag** (`v*`) — plain pushes to `main` are build-check only
+5. **Scans the image with Trivy** — results appear in GitHub Security → Code scanning
+6. Spins up a kind cluster and runs the job as an integration test — asserts `INFRASTRUCTURE IS HEALTHY`
+7. Pushes to Docker Hub **only on version tag** (`v*`) — plain pushes to `main` are build-check only
 
 ### Required GitHub secrets
 
@@ -231,6 +276,15 @@ git add uv.lock && git commit -m "Update lockfile"
 ---
 
 ## CNI detection layers
+
+Supported CNIs: **Calico · Flannel · Cilium · Canal · Weave · Antrea · OVN-Kubernetes · kube-router · kindnet · Multus · NSX-T · Submariner**
+
+| Distribution | Default CNI | Status |
+|---|---|---|
+| k3s | Flannel | Detected automatically |
+| Rancher RKE / RKE2 | Canal | Detected automatically |
+| kind | kindnet | Detected automatically |
+| EKS / GKE / AKS | Managed (varies) | Pod-label detection active |
 
 The tool identifies the installed CNI using three layers, falling back in order:
 
