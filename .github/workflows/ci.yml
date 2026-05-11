@@ -71,16 +71,19 @@ jobs:
           cache-to: type=gha,mode=max
 
       # ── Integration test ─────────────────────────────────────────────────────
-      - name: Delete any existing kind cluster
-        # Guarantees a completely fresh cluster every run.
-        # kind-action skips creation if a cluster with the same name already
-        # exists, which causes stale resources to bleed across CI runs.
-        run: kind delete cluster --name kind 2>/dev/null || true
-
-      - name: Create kind cluster
+      - name: Install kind, kubectl, helm
+        # install_only:true installs the tools without creating a cluster,
+        # so we can delete any stale cluster ourselves before creating a fresh one.
         uses: helm/kind-action@v1
         with:
-          cluster_name: kind
+          install_only: true
+
+      - name: Create fresh kind cluster
+        # Delete any cluster left over from a previous run on this runner VM,
+        # then create a brand-new one. Guarantees zero shared state.
+        run: |
+          kind delete cluster --name kind 2>/dev/null || true
+          kind create cluster --name kind --wait 90s
 
       - name: Wait for CoreDNS to be ready
         run: |
@@ -89,7 +92,7 @@ jobs:
             --timeout=90s
 
       - name: Load image into kind
-        run: kind load docker-image ${{ env.CI_IMAGE }}
+        run: kind load docker-image ${{ env.CI_IMAGE }} --name kind
 
       - name: Install devnopes via Helm
         # Helm creates the ServiceAccount, ClusterRole, ClusterRoleBinding, and Job.
