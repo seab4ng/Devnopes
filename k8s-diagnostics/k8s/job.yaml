@@ -58,12 +58,27 @@ spec:
           operator: Exists
           effect: NoSchedule
 
+      # Mount the host's CNI config directory so the tool can read CNI type directly.
+      # This is the most reliable CNI detection method (Layer 1).
+      # Remove this volume if your security policy prohibits hostPath mounts —
+      # the tool will fall back to CRD-based (Layer 2) and pod-label (Layer 3) detection.
+      volumes:
+        - name: cni-conf
+          hostPath:
+            path: /etc/cni/net.d
+            type: DirectoryOrCreate
+
       containers:
         - name: diagnostics
           # Replace with your internal registry path in airgap environments, e.g.:
           #   registry.internal.corp/tools/k8s-diagnostics:latest
           image: ghcr.io/seab4ng/devnopes/k8s-diagnostics:latest
           imagePullPolicy: IfNotPresent
+
+          volumeMounts:
+            - name: cni-conf
+              mountPath: /host/etc/cni/net.d
+              readOnly: true
 
           env:
             # ── OPTIONAL: network path test ───────────────────────────────────

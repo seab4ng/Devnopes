@@ -276,58 +276,244 @@ def check_kube_proxy(k8s):
 
 
 # ─── Check 5: CNI plugin ──────────────────────────────────────────────────────
-def check_cni(k8s):
-    section("CNI PLUGIN  (pod networking)")
-    v1 = k8s.CoreV1Api()
+#
+# CNI detection uses three layers, each more reliable than the next fallback:
+#
+#   Layer 1 — /etc/cni/net.d/ (host path, mounted as volume)
+#             The standard CNI config directory written by any CNI installer.
+#             Config files contain an explicit "type" or "name" field.
+#             This is authoritative — it's what kubelet actually reads.
+#
+#   Layer 2 — CRDs (Kubernetes API)
+#             Calico, Cilium, and Antrea register cluster-scoped CRDs with
+#             distinctive group names. Flannel and Weave do not, so this
+#             layer cannot identify them.
+#
+#   Layer 3 — Pod label scan in kube-system (last resort)
+#             Heuristic only. Works if the CNI uses well-known labels and
+#             runs in kube-system. Fails for custom installs or non-standard
+#             namespaces.
+#
+# The hostPath mount (/host/etc/cni/net.d) must be configured in job.yaml.
+# If the mount is missing the directory simply won't exist and we skip to Layer 2.
 
-    candidates = [
-        ("k8s-app=calico-node",                   "Calico"),
-        ("app=flannel",                            "Flannel"),
-        ("k8s-app=flannel",                        "Flannel"),
-        ("app=cilium",                             "Cilium"),
-        ("name=weave-net",                         "Weave"),
-        ("app=canal",                              "Canal"),
-        ("app=antrea-agent",                       "Antrea"),
-        ("app.kubernetes.io/name=calico",          "Calico"),
-        ("app.kubernetes.io/component=calico-node","Calico"),
-        ("k8s-app=calico-node",                    "Calico"),
-    ]
+CNI_CONF_DIR = "/host/etc/cni/net.d"   # mounted from host in job.yaml
 
-    cni_found = False
-    for selector, cni_name in candidates:
+# CRD group substrings that uniquely identify a CNI
+_CNI_CRD_SIGNATURES = [
+    ("projectcalico.org",   "Calico"),
+    ("crd.projectcalico.org", "Calico"),
+    ("cilium.io",           "Cilium"),
+    ("antrea.io",           "Antrea"),
+    ("k8s.ovn.org",         "OVN-Kubernetes"),
+    ("submariner.io",       "Submariner"),
+    ("nsx.vmware.com",      "NSX-T"),
+    ("k8s.cni.cncf.io",    "Multus"),
+]
+
+# Pod label selectors per CNI — only used in Layer 3
+_CNI_POD_LABELS = [
+    ("k8s-app=calico-node",                    "Calico"),
+    ("app.kubernetes.io/name=calico",           "Calico"),
+    ("app.kubernetes.io/component=calico-node", "Calico"),
+    ("app=flannel",                             "Flannel"),
+    ("k8s-app=flannel",                         "Flannel"),
+    ("app=cilium",                              "Cilium"),
+    ("k8s-app=cilium",                          "Cilium"),
+    ("name=weave-net",                          "Weave"),
+    ("app=canal",                               "Canal"),
+    ("app=antrea-agent",                        "Antrea"),
+    ("component=antrea-agent",                  "Antrea"),
+    ("app=ovs-cni-amd64",                       "OVS-CNI"),
+    ("app=ovn-kubernetes-node",                 "OVN-Kubernetes"),
+    ("app=kube-router",                         "kube-router"),
+]
+
+
+def _detect_cni_from_conf_dir():
+    """
+    Layer 1: read /host/etc/cni/net.d/*.conf and *.conflist.
+    Returns (cni_name, source_file) or (None, None).
+    """
+    import json, glob, os
+
+    if not os.path.isdir(CNI_CONF_DIR):
+        return None, None
+
+    conf_files = sorted(
+        glob.glob(f"{CNI_CONF_DIR}/*.conf") +
+        glob.glob(f"{CNI_CONF_DIR}/*.conflist")
+    )
+
+    if not conf_files:
+        return None, None
+
+    # CNI type strings found in config files → friendly name
+    _type_map = {
+        "calico":         "Calico",
+        "flannel":        "Flannel",
+        "cilium-cni":     "Cilium",
+        "cilium":         "Cilium",
+        "antrea":         "Antrea",
+        "weave-net":      "Weave",
+        "canal":          "Canal",
+        "ovn-k8s-cni-overlay": "OVN-Kubernetes",
+        "kube-router":    "kube-router",
+        "macvlan":        "macvlan",
+        "ipvlan":         "ipvlan",
+        "bridge":         "bridge",
+        "multus":         "Multus",
+    }
+
+    for path in conf_files:
         try:
-            pods = v1.list_namespaced_pod("kube-system", label_selector=selector).items
-            if not pods:
-                continue
-            cni_found = True
-
-            bad = [p for p in pods if not all(
-                cs.ready for cs in (p.status.container_statuses or [])
-            )]
-            if bad:
-                for p in bad:
-                    reason = p.status.phase
-                    for cs in (p.status.container_statuses or []):
-                        if cs.state and cs.state.waiting and cs.state.waiting.reason:
-                            reason = cs.state.waiting.reason
-                            break
-                    node = p.spec.node_name
-                    log(f"FAIL  {cni_name} pod '{p.metadata.name}'  node={node}  {reason}", "FAIL")
-                    IT_ISSUES.append(
-                        f"CNI ({cni_name}) pod '{p.metadata.name}' on node '{node}': {reason} — "
-                        "pod-to-pod networking is broken on that node"
-                    )
-            else:
-                log(f"OK    {cni_name}: {len(pods)}/{len(pods)} pods ready", "OK")
-            break
+            with open(path) as f:
+                data = json.load(f)
         except Exception:
             continue
 
-    if not cni_found:
-        log("WARN  No CNI pods found with known labels", "WARN")
+        # .conflist wraps plugins in a list
+        plugins = data.get("plugins", [data])
+        for plugin in plugins:
+            cni_type = plugin.get("type", "").lower()
+            if cni_type in _type_map:
+                return _type_map[cni_type], os.path.basename(path)
+            # fall back to the config "name" field
+            cni_name_field = plugin.get("name", "").lower()
+            for known_type, friendly in _type_map.items():
+                if known_type in cni_name_field:
+                    return friendly, os.path.basename(path)
+
+    # Files exist but none matched — return the raw type from the first file
+    try:
+        with open(conf_files[0]) as f:
+            data = json.load(f)
+        plugins = data.get("plugins", [data])
+        raw_type = plugins[0].get("type") or plugins[0].get("name") or "unknown"
+        return raw_type, os.path.basename(conf_files[0])
+    except Exception:
+        return None, None
+
+
+def _detect_cni_from_crds(k8s):
+    """
+    Layer 2: list installed CRDs and match against known CNI API group names.
+    Returns cni_name or None.
+    """
+    try:
+        ext = k8s.ApiextensionsV1Api()
+        crds = ext.list_custom_resource_definition().items
+        groups = {crd.spec.group for crd in crds}
+        for group in groups:
+            for signature, name in _CNI_CRD_SIGNATURES:
+                if signature in group:
+                    return name
+    except Exception:
+        pass
+    return None
+
+
+def _detect_cni_from_pods(k8s):
+    """
+    Layer 3: scan kube-system pods by known label selectors.
+    Returns (cni_name, pods_list) or (None, []).
+    """
+    v1 = k8s.CoreV1Api()
+    for selector, cni_name in _CNI_POD_LABELS:
+        try:
+            pods = v1.list_namespaced_pod("kube-system", label_selector=selector).items
+            if pods:
+                return cni_name, pods
+        except Exception:
+            continue
+    return None, []
+
+
+def _check_cni_pods(k8s, cni_name, pods):
+    """Given a CNI name and its pods, check readiness and report issues."""
+    total = len(pods)
+    bad = []
+    for p in pods:
+        cs_list = p.status.container_statuses or []
+        if not all(cs.ready for cs in cs_list):
+            reason = p.status.phase
+            for cs in cs_list:
+                if cs.state and cs.state.waiting and cs.state.waiting.reason:
+                    reason = cs.state.waiting.reason
+                    break
+            bad.append((p.metadata.name, p.spec.node_name, reason))
+
+    if bad:
+        for pname, node, reason in bad:
+            log(f"FAIL  {cni_name} pod '{pname}'  node={node}  {reason}", "FAIL")
+            IT_ISSUES.append(
+                f"CNI ({cni_name}) pod '{pname}' on node '{node}': {reason} — "
+                "pod-to-pod networking is broken on that node"
+            )
+    else:
+        log(f"OK    {cni_name}: {total}/{total} pods ready", "OK")
+
+
+def check_cni(k8s):
+    section("CNI PLUGIN  (pod networking)")
+
+    # ── Layer 1: host CNI config directory ───────────────────────────────────
+    cni_name, conf_file = _detect_cni_from_conf_dir()
+    if cni_name:
+        log(f"INFO  Detected via /etc/cni/net.d/{conf_file}  →  CNI: {cni_name}", "INFO")
+        detection = "config file"
+    else:
+        if CNI_CONF_DIR and __import__("os").path.isdir(CNI_CONF_DIR):
+            log(f"WARN  {CNI_CONF_DIR} exists but no recognisable CNI config found", "WARN")
+        else:
+            log(f"INFO  {CNI_CONF_DIR} not mounted — skipping config-file detection", "INFO")
+            log( "INFO  (add hostPath volume in job.yaml for most reliable detection)", "INFO")
+
+        # ── Layer 2: CRDs ─────────────────────────────────────────────────────
+        cni_name = _detect_cni_from_crds(k8s)
+        if cni_name:
+            log(f"INFO  Detected via installed CRDs  →  CNI: {cni_name}", "INFO")
+            detection = "CRD"
+        else:
+            detection = None
+
+    # ── Layer 3: pod labels (fallback / confirmation) ────────────────────────
+    pod_cni_name, cni_pods = _detect_cni_from_pods(k8s)
+
+    if not cni_name and not pod_cni_name:
+        log("WARN  CNI could not be identified by config file, CRDs, or pod labels", "WARN")
         WARNINGS.append(
-            "CNI pods not found under any known label selector "
-            "(Calico/Flannel/Cilium/Weave/Canal/Antrea) — verify CNI manually"
+            "CNI plugin identity unknown — "
+            "mount /etc/cni/net.d from the host (hostPath volume) for reliable detection. "
+            "Known CNIs checked: Calico, Flannel, Cilium, Weave, Canal, Antrea, OVN-Kubernetes, kube-router"
+        )
+        return
+
+    # If Layer 1/2 and Layer 3 both found something, cross-check them
+    if cni_name and pod_cni_name and cni_name != pod_cni_name:
+        log(
+            f"WARN  CNI name mismatch: {detection} says '{cni_name}', "
+            f"pod labels say '{pod_cni_name}'",
+            "WARN"
+        )
+        WARNINGS.append(
+            f"CNI identity conflict: config/CRD='{cni_name}', pods='{pod_cni_name}' — "
+            "possible multi-CNI setup (e.g. Multus) or misconfiguration"
+        )
+
+    final_name = cni_name or pod_cni_name
+
+    if cni_pods:
+        _check_cni_pods(k8s, final_name, cni_pods)
+    else:
+        log(
+            f"INFO  CNI identified as '{final_name}' via {detection or 'config'} "
+            f"but no agent pods found in kube-system",
+            "INFO"
+        )
+        WARNINGS.append(
+            f"CNI '{final_name}' identified but no agent pods found in kube-system — "
+            "CNI may run in a different namespace or as a static binary only"
         )
 
 
