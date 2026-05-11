@@ -9,8 +9,8 @@ on:
       - "pyproject.toml"
       - "uv.lock"
       - ".github/workflows/ci.yml"
-  tags:
-    - "v*"         # e.g. v1.0.0 — triggers a release build and push
+    tags:
+      - "v*"       # e.g. v1.0.0 — triggers a release build and push
 
 # Required GitHub secrets:
 #   DOCKERHUB_USERNAME  — your Docker Hub username
