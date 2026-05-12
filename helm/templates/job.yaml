@@ -76,13 +76,13 @@ spec:
             - name: KUBE_PROXY_EXTRA_LABELS
               value: {{ .Values.overrides.kubeProxy.extraLabels | join "," | quote }}
             {{- end }}
-            {{- if .Values.cniDetection.extraNamespaces }}
+            {{- if .Values.overrides.cni.extraNamespaces }}
             - name: CNI_EXTRA_NAMESPACES
-              value: {{ .Values.cniDetection.extraNamespaces | join "," | quote }}
+              value: {{ .Values.overrides.cni.extraNamespaces | join "," | quote }}
             {{- end }}
-            {{- if .Values.cniDetection.extraLabels }}
+            {{- if .Values.overrides.cni.extraLabels }}
             - name: CNI_EXTRA_LABELS
-              value: {{ .Values.cniDetection.extraLabels | join "," | quote }}
+              value: {{ .Values.overrides.cni.extraLabels | join "," | quote }}
             {{- end }}
 
           resources:

@@ -145,7 +145,7 @@ COREDNS_EXTRA_NAMESPACES=dns-system COREDNS_EXTRA_LABELS=app=my-coredns
 CNI_EXTRA_NAMESPACES=networking CNI_EXTRA_LABELS=app=my-cni:MyCNI
 ```
 
-**Via Helm** — same fields under `overrides` and `cniDetection` in `values.yaml`:
+**Via Helm** — all under `overrides` in `values.yaml`:
 ```yaml
 overrides:
   coreDns:
@@ -154,9 +154,9 @@ overrides:
   kubeProxy:
     extraNamespaces: ["kube-proxy-system"]
     extraLabels: ["app=kube-proxy-custom"]
-cniDetection:
-  extraNamespaces: ["networking"]
-  extraLabels: ["app=my-cni:MyCNI"]
+  cni:
+    extraNamespaces: ["networking"]
+    extraLabels: ["app=my-cni:MyCNI"]
 ```
 
 ### The service network path test (4 steps)

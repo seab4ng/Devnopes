@@ -25,7 +25,7 @@ config:
   # Default: 300 = last 5 minutes.
   logScanSeconds: "300"
 
-# ── Optional: service network path test ───────────────────────────────────────────
+# ── Optional: service network path test ───────────────────────────────────────
 # When enabled, the tool runs a 4-step test on a specific service:
 #   Step 1 — DNS resolution timing
 #   Step 2 — Ground-truth ClusterIP from K8s API
@@ -38,7 +38,7 @@ networkPathTest:
   namespace: default # namespace the service lives in
   port: 80           # port to TCP-probe
 
-# ── Component overrides ───────────────────────────────────────────────────────────────
+# ── Component overrides ───────────────────────────────────────────────────────────────────
 # Every check already has a comprehensive built-in list of namespaces and label selectors.
 # Use these fields ONLY to extend those lists when your distro uses non-standard values.
 # Leaving all fields empty keeps the built-in defaults — no configuration needed for
@@ -60,19 +60,14 @@ overrides:
     # Example: extraLabels: ["app=kube-proxy-custom", "component=proxy"]
     extraLabels: []
 
-# ── CNI detection customization ───────────────────────────────────────────────────────
-# Override or extend the built-in CNI pod label / namespace search.
-# Useful when your organisation uses non-standard labels or installs a CNI
-# in a custom namespace.
-cniDetection:
-  # Additional namespaces to search for CNI agent pods (appended to the built-in list).
-  # Example:  extraNamespaces: ["networking", "my-cni-ns"]
-  extraNamespaces: []
-
-  # Additional pod label selectors, each with a friendly CNI name.
-  # Format: "label-selector:FriendlyName"
-  # Example:  extraLabels: ["app=my-cni:MyCNI", "k8s-app=custom-cni:CustomCNI"]
-  extraLabels: []
+  cni:
+    # Extra namespaces to search for CNI agent pods (appended to the built-in list).
+    # Example: extraNamespaces: ["networking", "my-cni-ns"]
+    extraNamespaces: []
+    # Extra pod label selectors, each with a friendly CNI name.
+    # Format: "label-selector:FriendlyName"
+    # Example: extraLabels: ["app=my-cni:MyCNI", "k8s-app=custom-cni:CustomCNI"]
+    extraLabels: []
 
 # ── CNI config mount ─────────────────────────────────────────────────────────────────────────
 # Mounts /etc/cni/net.d from the host node so the tool can read the CNI config
