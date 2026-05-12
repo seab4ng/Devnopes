@@ -21,12 +21,11 @@ WORKDIR /app
 COPY --from=builder /app/.venv /app/.venv
 COPY diagnose.py .
 
-# Remove HIGH-CVE packages from system Python — not used at runtime (app runs from .venv).
-# pip uninstall removes files+dist-info; the find is a fallback in case pip leaves stragglers.
-RUN pip uninstall -y wheel "jaraco.context" 2>/dev/null || true \
-    && find /usr/local/lib/python3.11/site-packages -maxdepth 1 -type d \
-         \( -name "wheel-*.dist-info" -o -name "jaraco.context-*.dist-info" \) \
-         -exec rm -rf {} +
+# Remove HIGH-CVE packages — not needed at runtime (app runs from .venv only).
+# Uses site.getsitepackages() so the path is always correct regardless of Alpine layout.
+# Globs ALL wheel-* and jaraco.context-* dist-info dirs so stale leftovers are caught too.
+RUN python3 -c 'import shutil,pathlib,site;[shutil.rmtree(str(d),ignore_errors=True) or print("removed",d) for sp in site.getsitepackages() for pat in ["wheel-*.dist-info","jaraco.context-*.dist-info","jaraco_context-*.dist-info"] for d in pathlib.Path(sp).glob(pat)]' \
+    && pip uninstall -y wheel "jaraco.context" 2>/dev/null || true
 
 ENV PYTHONUNBUFFERED=1
 ENV PATH="/app/.venv/bin:$PATH"
