@@ -60,25 +60,21 @@ spec:
             - name: TARGET_PORT
               value: {{ .Values.networkPathTest.port | quote }}
             {{- end }}
-            {{- if .Values.overrides.coreDns.namespace }}
-            - name: COREDNS_NAMESPACE
-              value: {{ .Values.overrides.coreDns.namespace | quote }}
+            {{- if .Values.overrides.coreDns.extraNamespaces }}
+            - name: COREDNS_EXTRA_NAMESPACES
+              value: {{ .Values.overrides.coreDns.extraNamespaces | join "," | quote }}
             {{- end }}
-            {{- if .Values.overrides.coreDns.extraLabelSelectors }}
+            {{- if .Values.overrides.coreDns.extraLabels }}
             - name: COREDNS_EXTRA_LABELS
-              value: {{ .Values.overrides.coreDns.extraLabelSelectors | join "," | quote }}
+              value: {{ .Values.overrides.coreDns.extraLabels | join "," | quote }}
             {{- end }}
-            {{- if .Values.overrides.kubeProxy.namespace }}
-            - name: KUBE_PROXY_NAMESPACE
-              value: {{ .Values.overrides.kubeProxy.namespace | quote }}
+            {{- if .Values.overrides.kubeProxy.extraNamespaces }}
+            - name: KUBE_PROXY_EXTRA_NAMESPACES
+              value: {{ .Values.overrides.kubeProxy.extraNamespaces | join "," | quote }}
             {{- end }}
-            {{- if .Values.overrides.kubeProxy.daemonSetName }}
-            - name: KUBE_PROXY_DAEMONSET_NAME
-              value: {{ .Values.overrides.kubeProxy.daemonSetName | quote }}
-            {{- end }}
-            {{- if .Values.overrides.kubeProxy.extraLabelSelectors }}
+            {{- if .Values.overrides.kubeProxy.extraLabels }}
             - name: KUBE_PROXY_EXTRA_LABELS
-              value: {{ .Values.overrides.kubeProxy.extraLabelSelectors | join "," | quote }}
+              value: {{ .Values.overrides.kubeProxy.extraLabels | join "," | quote }}
             {{- end }}
             {{- if .Values.cniDetection.extraNamespaces }}
             - name: CNI_EXTRA_NAMESPACES

@@ -50,14 +50,15 @@ TARGET_NAMESPACE    = os.environ.get("TARGET_NAMESPACE","default")
 TARGET_PORT         = int(os.environ.get("TARGET_PORT", "80"))
 
 # ─── Per-component namespace / label overrides ────────────────────────────────
-# All have sensible defaults. Override via env var when your distro differs.
+# Every check has built-in default lists. Env vars only ADD to those lists —
+# omitting them leaves all defaults intact.
 
 def _split_env(key):
     """Return non-empty stripped items from a comma-separated env var."""
     return [s.strip() for s in os.environ.get(key, "").split(",") if s.strip()]
 
-# CoreDNS
-COREDNS_NAMESPACE = os.environ.get("COREDNS_NAMESPACE", "kube-system")
+# CoreDNS — searched in order; first match wins
+_COREDNS_NAMESPACES = ["kube-system"] + _split_env("COREDNS_EXTRA_NAMESPACES")
 _COREDNS_LABEL_SELECTORS = [
     "k8s-app=kube-dns",
     "app=coredns",
@@ -65,10 +66,13 @@ _COREDNS_LABEL_SELECTORS = [
     "k8s-app=coredns",
 ] + _split_env("COREDNS_EXTRA_LABELS")
 
-# kube-proxy
-KUBE_PROXY_NAMESPACE      = os.environ.get("KUBE_PROXY_NAMESPACE",      "kube-system")
-KUBE_PROXY_DAEMONSET_NAME = os.environ.get("KUBE_PROXY_DAEMONSET_NAME", "kube-proxy")
-_KUBE_PROXY_POD_SELECTORS = ["k8s-app=kube-proxy"] + _split_env("KUBE_PROXY_EXTRA_LABELS")
+# kube-proxy — searched in order; first match wins
+_KUBE_PROXY_NAMESPACES = ["kube-system"] + _split_env("KUBE_PROXY_EXTRA_NAMESPACES")
+_KUBE_PROXY_POD_SELECTORS = [
+    "k8s-app=kube-proxy",
+    "component=kube-proxy",
+    "app=kube-proxy",
+] + _split_env("KUBE_PROXY_EXTRA_LABELS")
 
 # ─── Finding bucket — only one category: IT Team ─────────────────────────────
 IT_ISSUES = []    # every problem here is cluster/infra — IT Team's responsibility
@@ -243,27 +247,32 @@ def check_cluster_dns(k8s=None):
         (f"kubernetes.default.svc.{CLUSTER_DOMAIN}",  "K8s API service (canonical cluster DNS test)"),
     ]
 
-    # Discover the CoreDNS service name from the API instead of hardcoding "kube-dns".
-    # RKE2 names it "rke2-coredns-rke2-coredns"; other distros may vary.
+    # Discover the CoreDNS service name dynamically — distros vary:
+    # standard="kube-dns", RKE2="rke2-coredns-rke2-coredns", etc.
     coredns_svc_name = None
+    coredns_svc_ns   = None
     if k8s:
         v1 = k8s.CoreV1Api()
-        for selector in _COREDNS_LABEL_SELECTORS:
-            try:
-                svcs = v1.list_namespaced_service(COREDNS_NAMESPACE, label_selector=selector).items
-                if svcs:
-                    coredns_svc_name = svcs[0].metadata.name
-                    break
-            except Exception:
-                pass
+        for ns in _COREDNS_NAMESPACES:
+            for selector in _COREDNS_LABEL_SELECTORS:
+                try:
+                    svcs = v1.list_namespaced_service(ns, label_selector=selector).items
+                    if svcs:
+                        coredns_svc_name = svcs[0].metadata.name
+                        coredns_svc_ns   = ns
+                        break
+                except Exception:
+                    pass
+            if coredns_svc_name:
+                break
 
     if coredns_svc_name:
         probes.append(
-            (f"{coredns_svc_name}.kube-system.svc.{CLUSTER_DOMAIN}", f"CoreDNS service ({coredns_svc_name})")
+            (f"{coredns_svc_name}.{coredns_svc_ns}.svc.{CLUSTER_DOMAIN}", f"CoreDNS service ({coredns_svc_name})")
         )
     else:
         probes.append(
-            (f"kube-dns.kube-system.svc.{CLUSTER_DOMAIN}", "CoreDNS service (kube-dns)")
+            (f"kube-dns.kube-system.svc.{CLUSTER_DOMAIN}", "CoreDNS service (kube-dns fallback)")
         )
 
     for name, description in probes:
@@ -322,27 +331,33 @@ _COREDNS_LOG_PATTERNS = [
 ]
 
 def check_coredns(k8s):
-    section(f"COREDNS PODS  ({COREDNS_NAMESPACE})")
+    section("COREDNS PODS")
     v1 = k8s.CoreV1Api()
 
     pods = []
-    try:
+    found_ns = None
+    for ns in _COREDNS_NAMESPACES:
         for selector in _COREDNS_LABEL_SELECTORS:
-            pods = v1.list_namespaced_pod(COREDNS_NAMESPACE, label_selector=selector).items
-            if pods:
-                break
-    except Exception as e:
-        log(f"WARN  Cannot list CoreDNS pods: {e}", "WARN")
-        WARNINGS.append(f"Could not list CoreDNS pods — API call failed: {e}")
-        return
+            try:
+                pods = v1.list_namespaced_pod(ns, label_selector=selector).items
+                if pods:
+                    found_ns = ns
+                    break
+            except Exception as e:
+                WARNINGS.append(f"Could not list CoreDNS pods in {ns}: {e}")
+        if pods:
+            break
 
     if not pods:
-        log(f"No CoreDNS/kube-dns pods found in {COREDNS_NAMESPACE}", "FAIL")
+        searched = ", ".join(_COREDNS_NAMESPACES)
+        log(f"No CoreDNS/kube-dns pods found (searched: {searched})", "FAIL")
         IT_ISSUES.append(
-            f"CRITICAL: No CoreDNS/kube-dns pods in {COREDNS_NAMESPACE} — "
+            f"CRITICAL: No CoreDNS/kube-dns pods found in [{searched}] — "
             "cluster DNS component is missing or deleted"
         )
         return
+
+    log(f"INFO  Found CoreDNS pods in namespace: {found_ns}", "INFO")
 
     for pod in pods:
         name      = pod.metadata.name
@@ -359,7 +374,7 @@ def check_coredns(k8s):
             # Matches go to WARNINGS (not IT_ISSUES): upstream forwarding errors
             # are common in restricted networks and do not mean cluster DNS is broken.
             container_name = cs_list[0].name if cs_list else "coredns"
-            hits = _scan_logs_for_patterns(k8s, COREDNS_NAMESPACE, name, container_name,
+            hits = _scan_logs_for_patterns(k8s, found_ns, name, container_name,
                                            _COREDNS_LOG_PATTERNS)
             if hits:
                 for meaning, example in hits:
@@ -447,60 +462,78 @@ def _check_kube_proxy_pods(k8s, pods, source):
 
 
 def check_kube_proxy(k8s):
-    section(f"KUBE-PROXY  (service routing / {KUBE_PROXY_NAMESPACE})")
-    apps = k8s.AppsV1Api()
-    v1   = k8s.CoreV1Api()
+    section("KUBE-PROXY  (service routing)")
+    apps_api = k8s.AppsV1Api()
+    v1       = k8s.CoreV1Api()
 
+    # Search for kube-proxy DaemonSet by label selector across all configured namespaces.
+    # DaemonSet metadata labels match pod selector labels in standard installs.
     ds = None
-    try:
-        ds = apps.read_namespaced_daemon_set(KUBE_PROXY_DAEMONSET_NAME, KUBE_PROXY_NAMESPACE)
-    except Exception as e:
-        if getattr(e, "status", None) != 404:
-            log(f"WARN  Cannot read kube-proxy daemonset: {e}", "WARN")
-            WARNINGS.append(f"Could not read kube-proxy daemonset: {e}")
+    ds_ns = None
+    for selector in _KUBE_PROXY_POD_SELECTORS:
+        for ns in _KUBE_PROXY_NAMESPACES:
+            try:
+                dsets = apps_api.list_namespaced_daemon_set(ns, label_selector=selector).items
+                if dsets:
+                    ds    = dsets[0]
+                    ds_ns = ns
+                    break
+            except Exception:
+                pass
+        if ds:
+            break
 
     if ds is not None:
+        ds_name = ds.metadata.name
         desired = ds.status.desired_number_scheduled or 0
         ready   = ds.status.number_ready or 0
         updated = ds.status.updated_number_scheduled or 0
 
         if ready < desired:
-            log(f"FAIL  kube-proxy: {ready}/{desired} pods ready  (updated={updated})", "FAIL")
+            log(f"FAIL  kube-proxy ({ds_name}/{ds_ns}): {ready}/{desired} pods ready  (updated={updated})", "FAIL")
             IT_ISSUES.append(
                 f"kube-proxy: {ready}/{desired} pods ready — "
                 "ClusterIP and NodePort routing is broken on unreachable nodes"
             )
         else:
-            log(f"OK    kube-proxy: {ready}/{desired} pods ready", "OK")
+            log(f"OK    kube-proxy ({ds_name}/{ds_ns}): {ready}/{desired} pods ready", "OK")
             pods = []
             for selector in _KUBE_PROXY_POD_SELECTORS:
-                pods = v1.list_namespaced_pod(
-                    KUBE_PROXY_NAMESPACE, label_selector=selector
-                ).items
-                if pods:
-                    break
-            _check_kube_proxy_pods(k8s, pods[:2], "daemonset")
+                try:
+                    pods = v1.list_namespaced_pod(ds_ns, label_selector=selector).items
+                    if pods:
+                        break
+                except Exception:
+                    pass
+            _check_kube_proxy_pods(k8s, pods[:2], f"daemonset/{ds_name}")
         return
 
     # DaemonSet not found — some distros (RKE2) run kube-proxy pods without a DaemonSet.
-    # Fall back to finding pods by label before concluding eBPF dataplane.
-    log(f"INFO  kube-proxy DaemonSet not found — checking for pods by label in {KUBE_PROXY_NAMESPACE}", "INFO")
+    # Fall back to pod label scan across all configured namespaces.
+    log("INFO  kube-proxy DaemonSet not found by label — checking for pods by label", "INFO")
     pods = []
+    found_ns = None
     for selector in _KUBE_PROXY_POD_SELECTORS:
-        try:
-            pods = v1.list_namespaced_pod(KUBE_PROXY_NAMESPACE, label_selector=selector).items
-            if pods:
-                break
-        except Exception as e:
-            WARNINGS.append(f"Could not list kube-proxy pods ({selector}): {e}")
+        for ns in _KUBE_PROXY_NAMESPACES:
+            try:
+                found = v1.list_namespaced_pod(ns, label_selector=selector).items
+                if found:
+                    pods     = found
+                    found_ns = ns
+                    break
+            except Exception as e:
+                WARNINGS.append(f"Could not list kube-proxy pods ({selector}) in {ns}: {e}")
+        if pods:
+            break
 
     if pods:
-        _check_kube_proxy_pods(k8s, pods, "pod label scan")
+        _check_kube_proxy_pods(k8s, pods, f"pod label scan/{found_ns}")
     else:
+        searched_ns = ", ".join(_KUBE_PROXY_NAMESPACES)
         log("INFO  kube-proxy not found (no DaemonSet, no pods) — eBPF dataplane assumed (Cilium / Calico eBPF)", "INFO")
         WARNINGS.append(
-            f"kube-proxy not found (no DaemonSet '{KUBE_PROXY_DAEMONSET_NAME}', "
-            f"no pods by labels {_KUBE_PROXY_POD_SELECTORS} in {KUBE_PROXY_NAMESPACE}); "
+            f"kube-proxy not found (no DaemonSet or pods matching {_KUBE_PROXY_POD_SELECTORS} "
+            f"in [{searched_ns}]); "
             "cluster likely uses an eBPF dataplane. Verify CNI handles service routing."
         )
 

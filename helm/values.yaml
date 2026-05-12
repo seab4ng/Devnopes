@@ -39,24 +39,26 @@ networkPathTest:
   port: 80           # port to TCP-probe
 
 # ── Component overrides ───────────────────────────────────────────────────────────────
-# Override namespace, label selectors, or names when your distro uses non-standard
-# values. Leave a field empty/null to keep the built-in default.
+# Every check already has a comprehensive built-in list of namespaces and label selectors.
+# Use these fields ONLY to extend those lists when your distro uses non-standard values.
+# Leaving all fields empty keeps the built-in defaults — no configuration needed for
+# standard clusters.
 overrides:
   coreDns:
-    # Namespace where CoreDNS pods and service run (default: kube-system).
-    namespace: ""
-    # Extra pod label selectors to try, appended to the built-in list.
-    # Example: ["app=my-dns:CoreDNS"]
-    extraLabelSelectors: []
+    # Extra namespaces to search for CoreDNS pods/service (appended to built-in: kube-system).
+    # Example: extraNamespaces: ["dns-system", "core-dns"]
+    extraNamespaces: []
+    # Extra pod label selectors to try (appended to built-in list).
+    # Example: extraLabels: ["app=my-coredns", "k8s-app=custom-dns"]
+    extraLabels: []
 
   kubeProxy:
-    # Namespace where kube-proxy DaemonSet / pods run (default: kube-system).
-    namespace: ""
-    # DaemonSet name to look up (default: kube-proxy).
-    daemonSetName: ""
-    # Extra pod label selectors to try, appended to k8s-app=kube-proxy.
-    # Example: ["app=kube-proxy-custom"]
-    extraLabelSelectors: []
+    # Extra namespaces to search for kube-proxy DaemonSet/pods (appended to built-in: kube-system).
+    # Example: extraNamespaces: ["kube-proxy-system"]
+    extraNamespaces: []
+    # Extra pod label selectors to try (appended to built-in list).
+    # Example: extraLabels: ["app=kube-proxy-custom", "component=proxy"]
+    extraLabels: []
 
 # ── CNI detection customization ───────────────────────────────────────────────────────
 # Override or extend the built-in CNI pod label / namespace search.

@@ -31,29 +31,6 @@ Designed for **airgap environments**. The running container needs zero internet 
 
 ---
 
-## Viewing results
-
-```bash
-# Stream live while the job runs
-kubectl logs -n kube-system job/devnopes --follow
-
-# Read after it completes
-kubectl logs -n kube-system job/devnopes
-
-# Also works by label
-kubectl logs -n kube-system -l job-name=devnopes
-
-# Check the job exit code (Complete = healthy, Failed = issues found)
-kubectl get job devnopes -n kube-system
-```
-
-The job exits **0** (`condition=Complete`) when infrastructure is healthy, **1** (`condition=Failed`) when issues are found. The full verdict and issue list are always printed in the logs before exit.
-
-In **k9s**: navigate to Jobs → `devnopes` → press `l` for logs.  
-In **Lens / OpenLens**: Workloads → Jobs → `devnopes` → Logs tab.
-
----
-
 ## Airgap usage
 
 The image is built in CI (which has internet) and pushed to Docker Hub. In airgap, you mirror it to your internal registry — the running container needs no outbound connectivity.
@@ -62,8 +39,8 @@ The image is built in CI (which has internet) and pushed to Docker Hub. In airga
 
 ```bash
 # On a machine with internet access:
-docker pull sokushinbutsu/devnopes:latest
-docker tag  sokushinbutsu/devnopes:latest \
+docker pull your-dockerhub-username/devnopes:latest
+docker tag  your-dockerhub-username/devnopes:latest \
             registry.internal.corp/tools/devnopes:latest
 docker push registry.internal.corp/tools/devnopes:latest
 ```
@@ -132,6 +109,8 @@ helm uninstall devnopes -n kube-system
 
 All variables are optional — defaults work for standard clusters.
 
+### Core config
+
 | Variable | Default | Description |
 |---|---|---|
 | `CLUSTER_DOMAIN` | `cluster.local` | Cluster DNS domain |
@@ -142,6 +121,43 @@ All variables are optional — defaults work for standard clusters.
 | `TARGET_SERVICE` | *(unset)* | **Optional.** Service name to run the 4-step network path test on |
 | `TARGET_NAMESPACE` | `default` | Namespace of `TARGET_SERVICE` |
 | `TARGET_PORT` | `80` | Port to TCP-probe for the network path test |
+
+### Component search customization
+
+Every check already has a comprehensive built-in list of namespaces and label selectors. These env vars only **add** to those lists — omitting them keeps all built-in defaults intact.
+
+| Variable | Appended to | Description |
+|---|---|---|
+| `COREDNS_EXTRA_NAMESPACES` | `kube-system` | Comma-separated extra namespaces to search for CoreDNS pods/service |
+| `COREDNS_EXTRA_LABELS` | built-in CoreDNS selectors | Comma-separated extra pod label selectors for CoreDNS |
+| `KUBE_PROXY_EXTRA_NAMESPACES` | `kube-system` | Comma-separated extra namespaces to search for kube-proxy DaemonSet/pods |
+| `KUBE_PROXY_EXTRA_LABELS` | built-in kube-proxy selectors | Comma-separated extra pod label selectors for kube-proxy |
+| `CNI_EXTRA_NAMESPACES` | built-in CNI namespaces | Comma-separated extra namespaces to search for CNI agent pods |
+| `CNI_EXTRA_LABELS` | built-in CNI selectors | Comma-separated `selector:FriendlyName` entries for CNI pod detection |
+
+**Example — non-standard CoreDNS namespace:**
+```bash
+COREDNS_EXTRA_NAMESPACES=dns-system COREDNS_EXTRA_LABELS=app=my-coredns
+```
+
+**Example — custom CNI:**
+```bash
+CNI_EXTRA_NAMESPACES=networking CNI_EXTRA_LABELS=app=my-cni:MyCNI
+```
+
+**Via Helm** — same fields under `overrides` and `cniDetection` in `values.yaml`:
+```yaml
+overrides:
+  coreDns:
+    extraNamespaces: ["dns-system"]
+    extraLabels: ["app=my-coredns"]
+  kubeProxy:
+    extraNamespaces: ["kube-proxy-system"]
+    extraLabels: ["app=kube-proxy-custom"]
+cniDetection:
+  extraNamespaces: ["networking"]
+  extraLabels: ["app=my-cni:MyCNI"]
+```
 
 ### The service network path test (4 steps)
 
@@ -164,26 +180,6 @@ The combination of results pinpoints the failure layer:
 
 ---
 
-## Security
-
-### Vulnerability scanning
-
-Every CI run scans the built Docker image with **[Trivy](https://github.com/aquasecurity/trivy)** (CRITICAL and HIGH severity). Results are uploaded to the **[GitHub Security tab → Code scanning](../../security/code-scanning)** as SARIF — no extra tools needed, just open the tab in GitHub.
-
-The scan runs on every push to `main` and on every release tag. It never blocks the build — it reports only, so you can review and decide what to patch.
-
-### Container security posture
-
-The container is hardened by default:
-
-- Runs as non-root (`runAsUser: 1000`, `runAsNonRoot: true`)
-- Read-only root filesystem (`readOnlyRootFilesystem: true`)
-- All Linux capabilities dropped (`capabilities.drop: ["ALL"]`)
-- No privilege escalation (`allowPrivilegeEscalation: false`)
-- Read-only RBAC only — no write permissions to any cluster resource
-
----
-
 ## CI — GitHub Actions
 
 The pipeline (`.github/workflows/ci.yml`) does:
@@ -192,9 +188,7 @@ The pipeline (`.github/workflows/ci.yml`) does:
 2. Runs `uv lock` — generates/verifies `uv.lock` (the dependency lockfile)
 3. Runs `uv sync --frozen --no-dev` — installs deps in CI for verification
 4. Builds the Docker image (multi-stage; all packages baked in at build time)
-5. **Scans the image with Trivy** — results appear in GitHub Security → Code scanning
-6. Spins up a kind cluster and runs the job as an integration test — asserts `INFRASTRUCTURE IS HEALTHY`
-7. Pushes to Docker Hub **only on version tag** (`v*`) — plain pushes to `main` are build-check only
+5. Pushes to Docker Hub **only on version tag** (`v*`) — plain pushes to `main` are build-check only
 
 ### Required GitHub secrets
 
@@ -205,7 +199,7 @@ Go to **Settings → Secrets and variables → Actions → New repository secret
 | `DOCKERHUB_USERNAME` | Your Docker Hub username |
 | `DOCKERHUB_TOKEN` | Docker Hub → Account Settings → Security → New Access Token |
 
-The image is pushed to `sokushinbutsu/devnopes`.
+The image is pushed to `<DOCKERHUB_USERNAME>/devnopes`.
 
 ### Image tags produced
 
@@ -277,19 +271,10 @@ git add uv.lock && git commit -m "Update lockfile"
 
 ## CNI detection layers
 
-Supported CNIs: **Calico · Flannel · Cilium · Canal · Weave · Antrea · OVN-Kubernetes · kube-router · kindnet · Multus · NSX-T · Submariner**
-
-| Distribution | Default CNI | Status |
-|---|---|---|
-| k3s | Flannel | Detected automatically |
-| Rancher RKE / RKE2 | Canal | Detected automatically |
-| kind | kindnet | Detected automatically |
-| EKS / GKE / AKS | Managed (varies) | Pod-label detection active |
-
 The tool identifies the installed CNI using three layers, falling back in order:
 
 1. **`/etc/cni/net.d/`** (hostPath volume) — reads the CNI JSON config file that kubelet itself uses. Most reliable. Enabled by default.
 2. **CRDs** — matches installed CRD API groups against known signatures (`projectcalico.org`, `cilium.io`, `antrea.io`, …). No hostPath needed.
-3. **Pod label scan** (fallback) — scans kube-system pods with known label selectors. Least reliable; can miss custom installs.
+3. **Pod label scan** (fallback) — scans pods across known CNI namespaces with known label selectors. Covers Calico, Flannel, Cilium, Weave, Canal, Antrea, OVN-Kubernetes, kube-router, kindnet, Multus, NSX-T.
 
 Disable the hostPath mount (`cniConfMount.enabled: false` in Helm / comment out the volume in `k8s/job.yaml`) if your security policy prohibits it — layers 2 and 3 activate automatically.
