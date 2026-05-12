@@ -64,8 +64,7 @@ jobs:
         # On tag pushes this same image is tagged and pushed to Docker Hub.
         uses: docker/build-push-action@v6
         with:
-          context: .
-          push: false
+          context: .          push: false
           load: true
           tags: ${{ env.CI_IMAGE }}
           cache-from: type=gha
@@ -102,9 +101,6 @@ jobs:
 
       - name: Load image into kind
         run: kind load docker-image ${{ env.CI_IMAGE }}
-
-      - name: Apply RBAC
-        run: kubectl apply -f k8s/rbac.yaml
 
       - name: Install devnopes via Helm
         # pullPolicy=Never — image was loaded locally above, do not pull from registry.
