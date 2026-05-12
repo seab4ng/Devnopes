@@ -1,4 +1,4 @@
-# ── Image ─────────────────────────────────────────────────────────────────────────────────
+# ── Image ─────────────────────────────────────────────────────────────────────────────────────────
 image:
   # In airgap environments, replace with your internal registry:
   #   repository: registry.internal.corp/tools/devnopes
@@ -6,7 +6,7 @@ image:
   tag: latest
   pullPolicy: IfNotPresent
 
-# ── Core cluster config ──────────────────────────────────────────────────────────────
+# ── Core cluster config ──────────────────────────────────────────────────────────────────
 config:
   # DNS domain of the cluster. Change if your cluster uses a custom domain.
   clusterDomain: cluster.local
@@ -38,7 +38,41 @@ networkPathTest:
   namespace: default # namespace the service lives in
   port: 80           # port to TCP-probe
 
-# ── CNI config mount ───────────────────────────────────────────────────────────────────
+# ── Component overrides ───────────────────────────────────────────────────────────────
+# Override namespace, label selectors, or names when your distro uses non-standard
+# values. Leave a field empty/null to keep the built-in default.
+overrides:
+  coreDns:
+    # Namespace where CoreDNS pods and service run (default: kube-system).
+    namespace: ""
+    # Extra pod label selectors to try, appended to the built-in list.
+    # Example: ["app=my-dns:CoreDNS"]
+    extraLabelSelectors: []
+
+  kubeProxy:
+    # Namespace where kube-proxy DaemonSet / pods run (default: kube-system).
+    namespace: ""
+    # DaemonSet name to look up (default: kube-proxy).
+    daemonSetName: ""
+    # Extra pod label selectors to try, appended to k8s-app=kube-proxy.
+    # Example: ["app=kube-proxy-custom"]
+    extraLabelSelectors: []
+
+# ── CNI detection customization ───────────────────────────────────────────────────────
+# Override or extend the built-in CNI pod label / namespace search.
+# Useful when your organisation uses non-standard labels or installs a CNI
+# in a custom namespace.
+cniDetection:
+  # Additional namespaces to search for CNI agent pods (appended to the built-in list).
+  # Example:  extraNamespaces: ["networking", "my-cni-ns"]
+  extraNamespaces: []
+
+  # Additional pod label selectors, each with a friendly CNI name.
+  # Format: "label-selector:FriendlyName"
+  # Example:  extraLabels: ["app=my-cni:MyCNI", "k8s-app=custom-cni:CustomCNI"]
+  extraLabels: []
+
+# ── CNI config mount ─────────────────────────────────────────────────────────────────────────
 # Mounts /etc/cni/net.d from the host node so the tool can read the CNI config
 # file directly — the most reliable way to identify which CNI is installed.
 # Disable if your security policy prohibits hostPath volumes; the tool will
@@ -47,7 +81,7 @@ cniConfMount:
   enabled: true
   hostPath: /etc/cni/net.d
 
-# ── Job settings ────────────────────────────────────────────────────────────────────
+# ── Job settings ──────────────────────────────────────────────────────────────────────────
 job:
   # Namespace to run the Job in. kube-system is recommended so the Job can
   # easily reach all cluster components.
@@ -67,7 +101,7 @@ job:
       operator: Exists
       effect: NoSchedule
 
-# ── Resource limits ───────────────────────────────────────────────────────────────────
+# ── Resource limits ───────────────────────────────────────────────────────────────────────────
 resources:
   requests:
     cpu: 50m

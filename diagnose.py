@@ -49,6 +49,27 @@ TARGET_SERVICE      = os.environ.get("TARGET_SERVICE",  "")
 TARGET_NAMESPACE    = os.environ.get("TARGET_NAMESPACE","default")
 TARGET_PORT         = int(os.environ.get("TARGET_PORT", "80"))
 
+# ─── Per-component namespace / label overrides ────────────────────────────────
+# All have sensible defaults. Override via env var when your distro differs.
+
+def _split_env(key):
+    """Return non-empty stripped items from a comma-separated env var."""
+    return [s.strip() for s in os.environ.get(key, "").split(",") if s.strip()]
+
+# CoreDNS
+COREDNS_NAMESPACE = os.environ.get("COREDNS_NAMESPACE", "kube-system")
+_COREDNS_LABEL_SELECTORS = [
+    "k8s-app=kube-dns",
+    "app=coredns",
+    "app.kubernetes.io/name=coredns",
+    "k8s-app=coredns",
+] + _split_env("COREDNS_EXTRA_LABELS")
+
+# kube-proxy
+KUBE_PROXY_NAMESPACE      = os.environ.get("KUBE_PROXY_NAMESPACE",      "kube-system")
+KUBE_PROXY_DAEMONSET_NAME = os.environ.get("KUBE_PROXY_DAEMONSET_NAME", "kube-proxy")
+_KUBE_PROXY_POD_SELECTORS = ["k8s-app=kube-proxy"] + _split_env("KUBE_PROXY_EXTRA_LABELS")
+
 # ─── Finding bucket — only one category: IT Team ─────────────────────────────
 IT_ISSUES = []    # every problem here is cluster/infra — IT Team's responsibility
 WARNINGS  = []    # informational / unable to verify
@@ -211,7 +232,7 @@ def check_resolv_conf():
 
 
 # ─── Check 2: Cluster DNS resolution + timing ─────────────────────────────────
-def check_cluster_dns():
+def check_cluster_dns(k8s=None):
     section("CLUSTER DNS RESOLUTION  (CoreDNS)")
 
     # These FQDNs MUST resolve in any healthy cluster — they are cluster-owned, not app-owned.
@@ -220,8 +241,30 @@ def check_cluster_dns():
     # internal domains), causing multi-second timeouts that are unrelated to CoreDNS health.
     probes = [
         (f"kubernetes.default.svc.{CLUSTER_DOMAIN}",  "K8s API service (canonical cluster DNS test)"),
-        (f"kube-dns.kube-system.svc.{CLUSTER_DOMAIN}", "CoreDNS service itself"),
     ]
+
+    # Discover the CoreDNS service name from the API instead of hardcoding "kube-dns".
+    # RKE2 names it "rke2-coredns-rke2-coredns"; other distros may vary.
+    coredns_svc_name = None
+    if k8s:
+        v1 = k8s.CoreV1Api()
+        for selector in _COREDNS_LABEL_SELECTORS:
+            try:
+                svcs = v1.list_namespaced_service(COREDNS_NAMESPACE, label_selector=selector).items
+                if svcs:
+                    coredns_svc_name = svcs[0].metadata.name
+                    break
+            except Exception:
+                pass
+
+    if coredns_svc_name:
+        probes.append(
+            (f"{coredns_svc_name}.kube-system.svc.{CLUSTER_DOMAIN}", f"CoreDNS service ({coredns_svc_name})")
+        )
+    else:
+        probes.append(
+            (f"kube-dns.kube-system.svc.{CLUSTER_DOMAIN}", "CoreDNS service (kube-dns)")
+        )
 
     for name, description in probes:
         ips, elapsed, err = _resolve_with_retry(name)
@@ -279,18 +322,13 @@ _COREDNS_LOG_PATTERNS = [
 ]
 
 def check_coredns(k8s):
-    section("COREDNS PODS  (kube-system)")
+    section(f"COREDNS PODS  ({COREDNS_NAMESPACE})")
     v1 = k8s.CoreV1Api()
 
     pods = []
     try:
-        for selector in (
-            "k8s-app=kube-dns",
-            "app=coredns",
-            "app.kubernetes.io/name=coredns",
-            "k8s-app=coredns",
-        ):
-            pods = v1.list_namespaced_pod("kube-system", label_selector=selector).items
+        for selector in _COREDNS_LABEL_SELECTORS:
+            pods = v1.list_namespaced_pod(COREDNS_NAMESPACE, label_selector=selector).items
             if pods:
                 break
     except Exception as e:
@@ -299,9 +337,9 @@ def check_coredns(k8s):
         return
 
     if not pods:
-        log("No CoreDNS/kube-dns pods found in kube-system", "FAIL")
+        log(f"No CoreDNS/kube-dns pods found in {COREDNS_NAMESPACE}", "FAIL")
         IT_ISSUES.append(
-            "CRITICAL: No CoreDNS/kube-dns pods in kube-system — "
+            f"CRITICAL: No CoreDNS/kube-dns pods in {COREDNS_NAMESPACE} — "
             "cluster DNS component is missing or deleted"
         )
         return
@@ -321,7 +359,7 @@ def check_coredns(k8s):
             # Matches go to WARNINGS (not IT_ISSUES): upstream forwarding errors
             # are common in restricted networks and do not mean cluster DNS is broken.
             container_name = cs_list[0].name if cs_list else "coredns"
-            hits = _scan_logs_for_patterns(k8s, "kube-system", name, container_name,
+            hits = _scan_logs_for_patterns(k8s, COREDNS_NAMESPACE, name, container_name,
                                            _COREDNS_LOG_PATTERNS)
             if hits:
                 for meaning, example in hits:
@@ -367,13 +405,61 @@ _KUBE_PROXY_LOG_PATTERNS = [
     (re.compile(r'error syncing rules',           re.IGNORECASE), "kube-proxy error syncing rules"),
 ]
 
+def _check_kube_proxy_pods(k8s, pods, source):
+    """Check readiness and scan logs for a list of kube-proxy pods."""
+    v1 = k8s.CoreV1Api()
+    total = len(pods)
+    unhealthy = []
+    for pod in pods:
+        phase   = pod.status.phase
+        cs_list = pod.status.container_statuses or []
+        ready   = all(cs.ready for cs in cs_list) if cs_list else (phase == "Running")
+        if not ready:
+            unhealthy.append(pod.metadata.name)
+
+    if unhealthy:
+        log(f"FAIL  kube-proxy: {total - len(unhealthy)}/{total} pods ready  ({source})", "FAIL")
+        IT_ISSUES.append(
+            f"kube-proxy: {total - len(unhealthy)}/{total} pods ready — "
+            "ClusterIP and NodePort routing is broken on unreachable nodes"
+        )
+    else:
+        log(f"OK    kube-proxy: {total}/{total} pods ready  ({source})", "OK")
+
+        for pod in pods[:2]:
+            cs_list = pod.status.container_statuses or []
+            container_name = cs_list[0].name if cs_list else "kube-proxy"
+            ns = pod.metadata.namespace or "kube-system"
+            hits = _scan_logs_for_patterns(k8s, ns, pod.metadata.name,
+                                           container_name, _KUBE_PROXY_LOG_PATTERNS)
+            if hits:
+                for meaning, example in hits:
+                    log(f"FAIL  {pod.metadata.name}  log error: {meaning}", "FAIL")
+                    log(f"      example: {example[:120]}", "INFO")
+                    IT_ISSUES.append(
+                        f"kube-proxy pod '{pod.metadata.name}' is Running/Ready but "
+                        f"has recent log errors ({meaning}) — "
+                        f"service routing rules are not being applied correctly. "
+                        f"Example: {example[:120]}"
+                    )
+            else:
+                log(f"OK    {pod.metadata.name}  no rule-sync errors in last {LOG_SCAN_SECONDS}s of logs", "OK")
+
+
 def check_kube_proxy(k8s):
-    section("KUBE-PROXY  (service routing)")
+    section(f"KUBE-PROXY  (service routing / {KUBE_PROXY_NAMESPACE})")
     apps = k8s.AppsV1Api()
     v1   = k8s.CoreV1Api()
 
+    ds = None
     try:
-        ds      = apps.read_namespaced_daemon_set("kube-proxy", "kube-system")
+        ds = apps.read_namespaced_daemon_set(KUBE_PROXY_DAEMONSET_NAME, KUBE_PROXY_NAMESPACE)
+    except Exception as e:
+        if getattr(e, "status", None) != 404:
+            log(f"WARN  Cannot read kube-proxy daemonset: {e}", "WARN")
+            WARNINGS.append(f"Could not read kube-proxy daemonset: {e}")
+
+    if ds is not None:
         desired = ds.status.desired_number_scheduled or 0
         ready   = ds.status.number_ready or 0
         updated = ds.status.updated_number_scheduled or 0
@@ -386,42 +472,37 @@ def check_kube_proxy(k8s):
             )
         else:
             log(f"OK    kube-proxy: {ready}/{desired} pods ready", "OK")
+            pods = []
+            for selector in _KUBE_PROXY_POD_SELECTORS:
+                pods = v1.list_namespaced_pod(
+                    KUBE_PROXY_NAMESPACE, label_selector=selector
+                ).items
+                if pods:
+                    break
+            _check_kube_proxy_pods(k8s, pods[:2], "daemonset")
+        return
 
-            # Daemonset looks healthy — scan recent logs for rule-sync failures.
-            # Pick up to 2 pods to check (one is usually enough, but 2 covers multi-node)
-            pods = v1.list_namespaced_pod(
-                "kube-system", label_selector="k8s-app=kube-proxy"
-            ).items[:2]
+    # DaemonSet not found — some distros (RKE2) run kube-proxy pods without a DaemonSet.
+    # Fall back to finding pods by label before concluding eBPF dataplane.
+    log(f"INFO  kube-proxy DaemonSet not found — checking for pods by label in {KUBE_PROXY_NAMESPACE}", "INFO")
+    pods = []
+    for selector in _KUBE_PROXY_POD_SELECTORS:
+        try:
+            pods = v1.list_namespaced_pod(KUBE_PROXY_NAMESPACE, label_selector=selector).items
+            if pods:
+                break
+        except Exception as e:
+            WARNINGS.append(f"Could not list kube-proxy pods ({selector}): {e}")
 
-            for pod in pods:
-                cs_list = pod.status.container_statuses or []
-                container_name = cs_list[0].name if cs_list else "kube-proxy"
-                hits = _scan_logs_for_patterns(k8s, "kube-system", pod.metadata.name,
-                                               container_name, _KUBE_PROXY_LOG_PATTERNS)
-                if hits:
-                    for meaning, example in hits:
-                        log(f"FAIL  {pod.metadata.name}  log error: {meaning}", "FAIL")
-                        log(f"      example: {example[:120]}", "INFO")
-                        IT_ISSUES.append(
-                            f"kube-proxy pod '{pod.metadata.name}' is Running/Ready but "
-                            f"has recent log errors ({meaning}) — "
-                            f"service routing rules are not being applied correctly. "
-                            f"Example: {example[:120]}"
-                        )
-                else:
-                    log(f"OK    {pod.metadata.name}  no rule-sync errors in last {LOG_SCAN_SECONDS}s of logs", "OK")
-
-    except Exception as e:
-        status = getattr(e, "status", None)
-        if status == 404:
-            log("INFO  kube-proxy daemonset not found — eBPF dataplane assumed (Cilium / Calico eBPF)", "INFO")
-            WARNINGS.append(
-                "kube-proxy daemonset not found; cluster likely uses an eBPF dataplane. "
-                "Verify CNI handles service routing."
-            )
-        else:
-            log(f"WARN  Cannot read kube-proxy daemonset: {e}", "WARN")
-            WARNINGS.append(f"Could not verify kube-proxy: {e}")
+    if pods:
+        _check_kube_proxy_pods(k8s, pods, "pod label scan")
+    else:
+        log("INFO  kube-proxy not found (no DaemonSet, no pods) — eBPF dataplane assumed (Cilium / Calico eBPF)", "INFO")
+        WARNINGS.append(
+            f"kube-proxy not found (no DaemonSet '{KUBE_PROXY_DAEMONSET_NAME}', "
+            f"no pods by labels {_KUBE_PROXY_POD_SELECTORS} in {KUBE_PROXY_NAMESPACE}); "
+            "cluster likely uses an eBPF dataplane. Verify CNI handles service routing."
+        )
 
 
 # ─── Check 5: CNI plugin ──────────────────────────────────────────────────────
@@ -438,10 +519,9 @@ def check_kube_proxy(k8s):
 #             distinctive group names. Flannel and Weave do not, so this
 #             layer cannot identify them.
 #
-#   Layer 3 — Pod label scan in kube-system (last resort)
-#             Heuristic only. Works if the CNI uses well-known labels and
-#             runs in kube-system. Fails for custom installs or non-standard
-#             namespaces.
+#   Layer 3 — Pod label scan across known CNI namespaces (last resort)
+#             Heuristic only. Covers all known CNI installers and namespaces.
+#             Extend via CNI_EXTRA_LABELS / CNI_EXTRA_NAMESPACES env vars.
 #
 # The hostPath mount (/host/etc/cni/net.d) must be configured in job.yaml.
 # If the mount is missing the directory simply won't exist and we skip to Layer 2.
@@ -460,24 +540,61 @@ _CNI_CRD_SIGNATURES = [
     ("k8s.cni.cncf.io",    "Multus"),
 ]
 
-# Pod label selectors per CNI — only used in Layer 3
+# Pod label selectors per CNI — only used in Layer 3.
+# Multiple selectors per CNI cover different installer versions and distros.
 _CNI_POD_LABELS = [
-    ("k8s-app=calico-node",                    "Calico"),
-    ("app.kubernetes.io/name=calico",           "Calico"),
-    ("app.kubernetes.io/component=calico-node", "Calico"),
-    ("app=flannel",                             "Flannel"),
-    ("k8s-app=flannel",                         "Flannel"),
-    ("app=cilium",                              "Cilium"),
-    ("k8s-app=cilium",                          "Cilium"),
-    ("name=weave-net",                          "Weave"),
-    ("app=canal",                               "Canal"),
-    ("app=antrea-agent",                        "Antrea"),
-    ("component=antrea-agent",                  "Antrea"),
-    ("app=ovs-cni-amd64",                       "OVS-CNI"),
-    ("app=ovn-kubernetes-node",                 "OVN-Kubernetes"),
-    ("app=kube-router",                         "kube-router"),
-    ("app=kindnet",                             "kindnet"),
+    # Calico (Tigera Operator and standalone installs)
+    ("k8s-app=calico-node",                     "Calico"),
+    ("app.kubernetes.io/name=calico",            "Calico"),
+    ("app.kubernetes.io/component=calico-node",  "Calico"),
+    # Flannel (upstream manifest, kube-flannel namespace installs, RKE/RKE2)
+    ("app=flannel",                              "Flannel"),
+    ("k8s-app=flannel",                          "Flannel"),
+    ("app.kubernetes.io/name=flannel",           "Flannel"),
+    ("k8s-app=kube-flannel",                     "Flannel"),
+    # Cilium (standalone, Helm, and managed variants)
+    ("app=cilium",                               "Cilium"),
+    ("k8s-app=cilium",                           "Cilium"),
+    ("app.kubernetes.io/name=cilium-agent",      "Cilium"),
+    ("app.kubernetes.io/part-of=cilium",         "Cilium"),
+    # Weave Net
+    ("name=weave-net",                           "Weave"),
+    ("k8s-app=weave-net",                        "Weave"),
+    # Canal (Flannel + Calico policy — common in RKE1)
+    ("app=canal",                                "Canal"),
+    ("k8s-app=canal",                            "Canal"),
+    # Antrea
+    ("app=antrea-agent",                         "Antrea"),
+    ("component=antrea-agent",                   "Antrea"),
+    ("app.kubernetes.io/component=antrea-agent", "Antrea"),
+    # OVN-Kubernetes (upstream and OpenShift variants)
+    ("app=ovs-cni-amd64",                        "OVS-CNI"),
+    ("app=ovn-kubernetes-node",                  "OVN-Kubernetes"),
+    ("app=ovnkube-node",                         "OVN-Kubernetes"),
+    ("component=ovnkube-node",                   "OVN-Kubernetes"),
+    # kube-router
+    ("app=kube-router",                          "kube-router"),
+    ("k8s-app=kube-router",                      "kube-router"),
+    # kindnet (kind clusters)
+    ("app=kindnet",                              "kindnet"),
+    # Multus (meta-CNI — usually paired with another CNI)
+    ("app=multus",                               "Multus"),
+    ("app.kubernetes.io/name=multus",            "Multus"),
+    # NSX-T (VMware)
+    ("component=nsx-node-agent",                 "NSX-T"),
+    ("app=nsx-node-agent",                       "NSX-T"),
 ]
+
+# Extra labels from env var CNI_EXTRA_LABELS (comma-separated "selector:FriendlyName").
+# Example: CNI_EXTRA_LABELS="app=my-cni:MyCNI,k8s-app=custom-cni:CustomCNI"
+_extra_labels_env = os.environ.get("CNI_EXTRA_LABELS", "")
+for _item in _extra_labels_env.split(","):
+    _item = _item.strip()
+    if ":" in _item:
+        _sel, _name = _item.rsplit(":", 1)
+        _sel, _name = _sel.strip(), _name.strip()
+        if _sel and _name:
+            _CNI_POD_LABELS.append((_sel, _name))
 
 
 def _detect_cni_from_conf_dir():
@@ -563,19 +680,45 @@ def _detect_cni_from_crds(k8s):
     return None
 
 
+# Namespaces where CNI agent pods may run.
+# Covers every known CNI installer default — kube-system is searched first.
+_CNI_POD_NAMESPACES = [
+    "kube-system",       # most CNIs: Flannel, Canal, kindnet, kube-router, older Calico/Cilium
+    "calico-system",     # Calico via Tigera Operator (Rancher, RKE2)
+    "tigera-operator",   # Tigera Operator itself
+    "cilium",            # Cilium Helm chart default namespace
+    "antrea",            # Antrea Helm chart default namespace
+    "canal-system",      # Canal on some distros
+    "kube-flannel",      # Flannel upstream manifest (newer versions)
+    "weave",             # Weave Net
+    "ovn-kubernetes",    # OVN-Kubernetes (upstream and OpenShift)
+    "nsx-system",        # NSX-T (VMware)
+    "multus",            # Multus meta-CNI
+]
+
+# Extra namespaces from env var CNI_EXTRA_NAMESPACES (comma-separated).
+# Example: CNI_EXTRA_NAMESPACES="networking,my-cni-ns"
+_extra_ns_env = os.environ.get("CNI_EXTRA_NAMESPACES", "")
+for _ns in _extra_ns_env.split(","):
+    _ns = _ns.strip()
+    if _ns and _ns not in _CNI_POD_NAMESPACES:
+        _CNI_POD_NAMESPACES.append(_ns)
+
+
 def _detect_cni_from_pods(k8s):
     """
-    Layer 3: scan kube-system pods by known label selectors.
+    Layer 3: scan pods by known label selectors across multiple namespaces.
     Returns (cni_name, pods_list) or (None, []).
     """
     v1 = k8s.CoreV1Api()
     for selector, cni_name in _CNI_POD_LABELS:
-        try:
-            pods = v1.list_namespaced_pod("kube-system", label_selector=selector).items
-            if pods:
-                return cni_name, pods
-        except Exception:
-            continue
+        for ns in _CNI_POD_NAMESPACES:
+            try:
+                pods = v1.list_namespaced_pod(ns, label_selector=selector).items
+                if pods:
+                    return cni_name, pods
+            except Exception:
+                continue
     return None, []
 
 
@@ -640,7 +783,8 @@ def check_cni(k8s):
         WARNINGS.append(
             "CNI plugin identity unknown — "
             "mount /etc/cni/net.d from the host (hostPath volume) for reliable detection. "
-            "Known CNIs checked: Calico, Flannel, Cilium, Weave, Canal, Antrea, OVN-Kubernetes, kube-router"
+            "Known CNIs checked: Calico, Flannel, Cilium, Weave, Canal, Antrea, OVN-Kubernetes, "
+            "kube-router, kindnet, Multus, NSX-T"
         )
         return
 
@@ -663,12 +807,12 @@ def check_cni(k8s):
     else:
         log(
             f"INFO  CNI identified as '{final_name}' via {detection or 'config'} "
-            f"but no agent pods found in kube-system",
+            f"but no agent pods found in searched namespaces",
             "INFO"
         )
         WARNINGS.append(
-            f"CNI '{final_name}' identified but no agent pods found in kube-system — "
-            "CNI may run in a different namespace or as a static binary only"
+            f"CNI '{final_name}' identified but no agent pods found — "
+            "CNI may run in an unexpected namespace or as a static binary only"
         )
 
 
@@ -1001,9 +1145,9 @@ def main():
         print("  network path test : disabled (set TARGET_SERVICE to enable)")
 
     check_resolv_conf()
-    check_cluster_dns()
-
     k8s = init_k8s()
+    check_cluster_dns(k8s)
+
     if k8s:
         check_coredns(k8s)
         check_kube_proxy(k8s)

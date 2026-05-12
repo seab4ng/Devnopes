@@ -60,6 +60,34 @@ spec:
             - name: TARGET_PORT
               value: {{ .Values.networkPathTest.port | quote }}
             {{- end }}
+            {{- if .Values.overrides.coreDns.namespace }}
+            - name: COREDNS_NAMESPACE
+              value: {{ .Values.overrides.coreDns.namespace | quote }}
+            {{- end }}
+            {{- if .Values.overrides.coreDns.extraLabelSelectors }}
+            - name: COREDNS_EXTRA_LABELS
+              value: {{ .Values.overrides.coreDns.extraLabelSelectors | join "," | quote }}
+            {{- end }}
+            {{- if .Values.overrides.kubeProxy.namespace }}
+            - name: KUBE_PROXY_NAMESPACE
+              value: {{ .Values.overrides.kubeProxy.namespace | quote }}
+            {{- end }}
+            {{- if .Values.overrides.kubeProxy.daemonSetName }}
+            - name: KUBE_PROXY_DAEMONSET_NAME
+              value: {{ .Values.overrides.kubeProxy.daemonSetName | quote }}
+            {{- end }}
+            {{- if .Values.overrides.kubeProxy.extraLabelSelectors }}
+            - name: KUBE_PROXY_EXTRA_LABELS
+              value: {{ .Values.overrides.kubeProxy.extraLabelSelectors | join "," | quote }}
+            {{- end }}
+            {{- if .Values.cniDetection.extraNamespaces }}
+            - name: CNI_EXTRA_NAMESPACES
+              value: {{ .Values.cniDetection.extraNamespaces | join "," | quote }}
+            {{- end }}
+            {{- if .Values.cniDetection.extraLabels }}
+            - name: CNI_EXTRA_LABELS
+              value: {{ .Values.cniDetection.extraLabels | join "," | quote }}
+            {{- end }}
 
           resources:
             {{- toYaml .Values.resources | nindent 12 }}
