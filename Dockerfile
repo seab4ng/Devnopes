@@ -24,7 +24,7 @@ COPY diagnose.py .
 # Upgrade system-Python packages with known HIGH CVEs.
 # Our app runs from .venv; these system packages are not used at runtime
 # but Trivy scans them. Pinning to patched versions eliminates the findings.
-RUN pip install --no-cache-dir --upgrade "wheel>=0.47.0" "jaraco.context>=6.0"
+RUN pip install --no-cache-dir --force-reinstall "wheel>=0.47.0" "jaraco.context>=6.0.0"
 
 ENV PYTHONUNBUFFERED=1
 ENV PATH="/app/.venv/bin:$PATH"
