@@ -2,12 +2,6 @@ version = 1
 revision = 3
 requires-python = ">=3.11"
 
-[manifest]
-constraints = [
-    { name = "jaraco-context", specifier = ">=6.0.0" },
-    { name = "wheel", specifier = ">=0.46.0" },
-]
-
 [[package]]
 name = "certifi"
 version = "2026.4.22"
