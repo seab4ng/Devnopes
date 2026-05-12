@@ -17,63 +17,50 @@ on:
 # Required GitHub secrets:
 #   DOCKERHUB_USERNAME  — your Docker Hub username
 #   DOCKERHUB_TOKEN     — Docker Hub access token
-#                         (Docker Hub → Account Settings → Security → New Access Token)
-#
-# Image is pushed to:  <DOCKERHUB_USERNAME>/devnopes:<tag>  and  :latest
 
 env:
   IMAGE_NAME: ${{ secrets.DOCKERHUB_USERNAME }}/devnopes
   CI_IMAGE: devnopes:ci-test
 
 jobs:
-  build-test-push:
+
+  # ── Stage 1: Verify ─────────────────────────────────────────────────────────
+  # Fast checks before spending time on a Docker build.
+  verify:
     runs-on: ubuntu-latest
-
     permissions:
-      contents: write          # required to push Helm chart to gh-pages
-      security-events: write   # required to upload Trivy SARIF to GitHub Security tab
-
+      contents: read
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
 
-      - name: Set chart version from tag
-        # Strips the leading 'v' so Chart.yaml gets "1.2.3", not "v1.2.3".
-        if: startsWith(github.ref, 'refs/tags/')
-        run: |
-          VERSION="${{ github.ref_name }}"
-          VERSION="${VERSION#v}"
-          sed -i "s/^version: .*/version: ${VERSION}/" helm/Chart.yaml
-          sed -i "s/^appVersion: .*/appVersion: \"${VERSION}\"/" helm/Chart.yaml
-
-      # ── Python dependency management via uv ──────────────────────────────────────────────
-      # uv is a fast Python package manager (written in Rust).
-      # It generates uv.lock (the lockfile) and installs from it.
-      # This step runs in CI — NOT inside the Docker container at runtime.
-      - name: Install uv
-        uses: astral-sh/setup-uv@v4
+      - uses: astral-sh/setup-uv@v4
         with:
           version: "0.5.4"
           enable-cache: true
           cache-dependency-glob: "uv.lock"
 
-      - name: Generate / verify lockfile
-        # uv lock is idempotent: no-op if pyproject.toml hasn't changed.
-        # Generates uv.lock on first run; verifies it on subsequent runs.
+      - name: Verify lockfile
         run: uv lock
 
-      - name: Install dependencies (CI verification)
-        # Installs exactly the versions pinned in uv.lock — no surprises.
-        # This also smoke-tests that the lockfile is valid.
+      - name: Install dependencies
         run: uv sync --frozen --no-dev
 
-      # ── Docker: build ───────────────────────────────────────────────────────────
-      - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v3
+      - name: Lint Helm chart
+        run: helm lint ./helm
 
-      - name: Build image (load into local daemon)
-        # Always built and loaded locally — used by the integration test below.
-        # On tag pushes this same image is tagged and pushed to Docker Hub.
+  # ── Stage 2: Build ──────────────────────────────────────────────────────────
+  # Builds the Docker image once and exports it as an artifact for reuse.
+  build:
+    needs: verify
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: docker/setup-buildx-action@v3
+
+      - name: Build image
         uses: docker/build-push-action@v6
         with:
           context: .
@@ -83,7 +70,32 @@ jobs:
           cache-from: type=gha
           cache-to: type=gha,mode=max
 
-      # ── Security: vulnerability scan ──────────────────────────────────────────
+      - name: Export image artifact
+        run: docker save ${{ env.CI_IMAGE }} | gzip > /tmp/image.tar.gz
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: docker-image
+          path: /tmp/image.tar.gz
+          retention-days: 1
+
+  # ── Stage 3a: Scan ──────────────────────────────────────────────────────────
+  # Vulnerability scan — runs in parallel with test.
+  scan:
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      security-events: write   # required to upload Trivy SARIF
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: docker-image
+          path: /tmp
+
+      - name: Load image
+        run: docker load < /tmp/image.tar.gz
+
       - name: Scan image for vulnerabilities (Trivy)
         uses: aquasecurity/trivy-action@v0.36.0
         with:
@@ -99,7 +111,24 @@ jobs:
         with:
           sarif_file: trivy-results.sarif
 
-      # ── Integration test ───────────────────────────────────────────────────────────
+  # ── Stage 3b: Test ──────────────────────────────────────────────────────────
+  # Integration test against a real kind cluster — runs in parallel with scan.
+  test:
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: docker-image
+          path: /tmp
+
+      - name: Load image
+        run: docker load < /tmp/image.tar.gz
+
       - name: Create kind cluster
         uses: helm/kind-action@v1
         with:
@@ -115,9 +144,6 @@ jobs:
         run: kind load docker-image ${{ env.CI_IMAGE }} --name kind
 
       - name: Deploy devnopes
-        # helm template | kubectl apply is fully idempotent: it never fails on
-        # pre-existing resources regardless of who created them or cluster state.
-        # Delete the Job first because Job specs are immutable once created.
         run: |
           kubectl delete job devnopes -n kube-system --ignore-not-found=true
           helm template devnopes ./helm \
@@ -129,8 +155,6 @@ jobs:
           | kubectl apply -f -
 
       - name: Wait for job to finish
-        # Wait for Complete OR Failed — the job exits non-zero when infra issues
-        # are found, which sets condition=failed not condition=complete.
         run: |
           kubectl wait -n kube-system job/devnopes \
             --for=condition=complete \
@@ -145,40 +169,53 @@ jobs:
           echo "$LOGS"
           echo "$LOGS" | grep "INFRASTRUCTURE IS HEALTHY"
 
-      # ── Docker: push (tag releases only) ─────────────────────────────────────────────
+  # ── Stage 4: Release ─────────────────────────────────────────────────────────
+  # Pushes Docker image + publishes Helm chart. Only runs on version tags.
+  release:
+    needs: [scan, test]
+    if: startsWith(github.ref, 'refs/tags/')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write   # required to push Helm chart to gh-pages
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set chart version from tag
+        run: |
+          VERSION="${{ github.ref_name }}"
+          VERSION="${VERSION#v}"
+          sed -i "s/^version: .*/version: ${VERSION}/" helm/Chart.yaml
+          sed -i "s/^appVersion: .*/appVersion: \"${VERSION}\"/" helm/Chart.yaml
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: docker-image
+          path: /tmp
+
+      - name: Load image
+        run: docker load < /tmp/image.tar.gz
+
       - name: Login to Docker Hub
-        if: startsWith(github.ref, 'refs/tags/')
         uses: docker/login-action@v3
         with:
           username: ${{ secrets.DOCKERHUB_USERNAME }}
           password: ${{ secrets.DOCKERHUB_TOKEN }}
 
-      - name: Tag and push release image
-        # Uses the image already built and tested above.
-        # github.ref_name on a tag push is the tag name verbatim (e.g. v1.0.0).
-        if: startsWith(github.ref, 'refs/tags/')
+      - name: Push Docker image
         run: |
           docker tag ${{ env.CI_IMAGE }} ${{ env.IMAGE_NAME }}:${{ github.ref_name }}
           docker tag ${{ env.CI_IMAGE }} ${{ env.IMAGE_NAME }}:latest
           docker push ${{ env.IMAGE_NAME }}:${{ github.ref_name }}
           docker push ${{ env.IMAGE_NAME }}:latest
 
-      # ── Helm chart: publish to GitHub Pages ──────────────────────────────────────────
       - name: Publish Helm chart to GitHub Pages
-        # Packages the chart and updates the Helm repo index on the gh-pages branch.
-        # Chart.yaml version was already set by "Set chart version from tag" above.
-        if: startsWith(github.ref, 'refs/tags/')
         run: |
           VERSION="${{ github.ref_name }}"
           VERSION="${VERSION#v}"
 
-          # Copy root README into the chart so ArtifactHub displays it
           cp README.md helm/README.md
-
-          # Package the chart
           helm package ./helm --destination /tmp/helm-pkg
 
-          # Switch to gh-pages and update the repo
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
           git fetch origin gh-pages
