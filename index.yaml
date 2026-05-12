@@ -2,8 +2,26 @@ apiVersion: v1
 entries:
   devnopes:
   - apiVersion: v2
+    appVersion: 0.1.4
+    created: "2026-05-12T09:41:30.023381146Z"
+    description: 'Kubernetes cluster infrastructure health checker. Runs as a Job
+      and determines whether problems are IT Team (cluster/infra) or DevOps (deployment)
+      responsibility. Designed for airgap environments. '
+    digest: 3bf0bcc5bd1ad0cc4762afbaa515e0d3a221917504b99cc54b39ebf68947e682
+    keywords:
+    - diagnostics
+    - networking
+    - dns
+    - airgap
+    - troubleshooting
+    name: devnopes
+    type: application
+    urls:
+    - https://seab4ng.github.io/Devnopes/devnopes-0.1.4.tgz
+    version: 0.1.4
+  - apiVersion: v2
     appVersion: 0.1.3
-    created: "2026-05-12T09:02:40.239359895Z"
+    created: "2026-05-12T09:41:30.022983208Z"
     description: 'Kubernetes cluster infrastructure health checker. Runs as a Job
       and determines whether problems are IT Team (cluster/infra) or DevOps (deployment)
       responsibility. Designed for airgap environments. '
@@ -21,7 +39,7 @@ entries:
     version: 0.1.3
   - apiVersion: v2
     appVersion: 0.1.2
-    created: "2026-05-12T09:02:40.238981647Z"
+    created: "2026-05-12T09:41:30.02257506Z"
     description: 'Kubernetes cluster infrastructure health checker. Runs as a Job
       and determines whether problems are IT Team (cluster/infra) or DevOps (deployment)
       responsibility. Designed for airgap environments. '
@@ -37,4 +55,4 @@ entries:
     urls:
     - https://seab4ng.github.io/Devnopes/devnopes-0.1.2.tgz
     version: 0.1.2
-generated: "2026-05-12T09:02:40.238529077Z"
+generated: "2026-05-12T09:41:30.022087486Z"
