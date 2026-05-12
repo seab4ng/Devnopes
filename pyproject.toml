@@ -12,3 +12,7 @@ dependencies = [
 # Run `uv lock` once after cloning (requires internet) to generate uv.lock,
 # then commit uv.lock. CI and Docker both use the committed lockfile — no
 # internet access is required at runtime or inside the cluster.
+constraint-dependencies = [
+    "wheel>=0.46.0",
+    "jaraco.context>=6.0.0",
+]

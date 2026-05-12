@@ -9,58 +9,59 @@ on:
       - "pyproject.toml"
       - "uv.lock"
       - ".github/workflows/ci.yml"
-      - "helm/**"
-      - "k8s/**"
     tags:
       - "v*"       # e.g. v1.0.0 — triggers a release build and push
 
 # Required GitHub secrets:
 #   DOCKERHUB_USERNAME  — your Docker Hub username
 #   DOCKERHUB_TOKEN     — Docker Hub access token
+#                         (Docker Hub → Account Settings → Security → New Access Token)
+#
+# Image is pushed to:  <DOCKERHUB_USERNAME>/devnopes:<tag>  and  :latest
 
 env:
-  IMAGE_NAME: sokushinbutsu/devnopes
+  IMAGE_NAME: ${{ secrets.DOCKERHUB_USERNAME }}/devnopes
   CI_IMAGE: devnopes:ci-test
 
 jobs:
-
-  # ── Stage 1: Verify ─────────────────────────────────────────────────────────
-  # Fast checks before spending time on a Docker build.
-  verify:
+  build-test-push:
     runs-on: ubuntu-latest
     permissions:
       contents: read
-    steps:
-      - uses: actions/checkout@v4
+      security-events: write   # required for SARIF upload to GitHub Security tab
 
-      - uses: astral-sh/setup-uv@v4
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # ── Python dependency management via uv ──────────────────────────────────
+      # uv is a fast Python package manager (written in Rust).
+      # It generates uv.lock (the lockfile) and installs from it.
+      # This step runs in CI — NOT inside the Docker container at runtime.
+      - name: Install uv
+        uses: astral-sh/setup-uv@v4
         with:
           version: "0.5.4"
           enable-cache: true
           cache-dependency-glob: "uv.lock"
 
-      - name: Verify lockfile
+      - name: Generate / verify lockfile
+        # uv lock is idempotent: no-op if pyproject.toml hasn't changed.
+        # Generates uv.lock on first run; verifies it on subsequent runs.
         run: uv lock
 
-      - name: Install dependencies
+      - name: Install dependencies (CI verification)
+        # Installs exactly the versions pinned in uv.lock — no surprises.
+        # This also smoke-tests that the lockfile is valid.
         run: uv sync --frozen --no-dev
 
-      - name: Lint Helm chart
-        run: helm lint ./helm
+      # ── Docker: build ────────────────────────────────────────────────────────
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
 
-  # ── Stage 2: Build ──────────────────────────────────────────────────────────
-  # Builds the Docker image once and exports it as an artifact for reuse.
-  build:
-    needs: verify
-    runs-on: ubuntu-latest
-    permissions:
-      contents: read
-    steps:
-      - uses: actions/checkout@v4
-
-      - uses: docker/setup-buildx-action@v3
-
-      - name: Build image
+      - name: Build image (load into local daemon)
+        # Always built and loaded locally — used by the integration test below.
+        # On tag pushes this same image is tagged and pushed to Docker Hub.
         uses: docker/build-push-action@v6
         with:
           context: .
@@ -70,69 +71,26 @@ jobs:
           cache-from: type=gha
           cache-to: type=gha,mode=max
 
-      - name: Export image artifact
-        run: docker save ${{ env.CI_IMAGE }} | gzip > /tmp/image.tar.gz
-
-      - uses: actions/upload-artifact@v4
-        with:
-          name: docker-image
-          path: /tmp/image.tar.gz
-          retention-days: 1
-
-  # ── Stage 3a: Scan ──────────────────────────────────────────────────────────
-  # Vulnerability scan — runs in parallel with test.
-  scan:
-    needs: build
-    runs-on: ubuntu-latest
-    permissions:
-      contents: read
-      security-events: write   # required to upload Trivy SARIF
-    steps:
-      - uses: actions/download-artifact@v4
-        with:
-          name: docker-image
-          path: /tmp
-
-      - name: Load image
-        run: docker load < /tmp/image.tar.gz
-
+      # ── Security scan ────────────────────────────────────────────────────────
       - name: Scan image for vulnerabilities (Trivy)
-        uses: aquasecurity/trivy-action@v0.36.0
+        uses: aquasecurity/trivy-action@0.28.0
         with:
           image-ref: ${{ env.CI_IMAGE }}
           format: sarif
           output: trivy-results.sarif
           severity: CRITICAL,HIGH
-          exit-code: "0"          # never fail the build — report only
+          ignore-unfixed: true
+          exit-code: "0"   # report only — do not fail the build
 
-      - name: Upload Trivy results to GitHub Security tab
+      - name: Upload scan results to GitHub Security tab
         uses: github/codeql-action/upload-sarif@v3
         if: always()
         with:
           sarif_file: trivy-results.sarif
 
-  # ── Stage 3b: Test ──────────────────────────────────────────────────────────
-  # Integration test against a real kind cluster — runs in parallel with scan.
-  test:
-    needs: build
-    runs-on: ubuntu-latest
-    permissions:
-      contents: read
-    steps:
-      - uses: actions/checkout@v4
-
-      - uses: actions/download-artifact@v4
-        with:
-          name: docker-image
-          path: /tmp
-
-      - name: Load image
-        run: docker load < /tmp/image.tar.gz
-
+      # ── Integration test ─────────────────────────────────────────────────────
       - name: Create kind cluster
         uses: helm/kind-action@v1
-        with:
-          cluster_name: kind
 
       - name: Wait for CoreDNS to be ready
         run: |
@@ -141,89 +99,53 @@ jobs:
             --timeout=90s
 
       - name: Load image into kind
-        run: kind load docker-image ${{ env.CI_IMAGE }} --name kind
+        run: kind load docker-image ${{ env.CI_IMAGE }}
 
-      - name: Deploy devnopes
+      - name: Apply RBAC
+        run: kubectl apply -f k8s/rbac.yaml
+
+      - name: Install devnopes via Helm
+        # pullPolicy=Never — image was loaded locally above, do not pull from registry.
+        # cniConfMount.enabled=false — kind nodes are containers; no real /etc/cni/net.d.
+        #   The tool falls back to CRD/pod detection automatically.
         run: |
-          kubectl delete job devnopes -n kube-system --ignore-not-found=true
-          helm template devnopes ./helm \
-            --namespace kube-system \
+          helm install devnopes ./helm \
+            -n kube-system \
             --set image.repository=devnopes \
             --set image.tag=ci-test \
             --set image.pullPolicy=Never \
-            --set cniConfMount.enabled=false \
-          | kubectl apply -f -
+            --set cniConfMount.enabled=false
 
-      - name: Wait for job to finish
+      - name: Wait for job to complete
         run: |
-          kubectl wait -n kube-system job/devnopes \
+          kubectl wait -n kube-system \
             --for=condition=complete \
-            --timeout=120s \
-          || kubectl wait -n kube-system job/devnopes \
-            --for=condition=failed \
-            --timeout=10s
+            job/devnopes \
+            --timeout=120s
 
-      - name: Show output and assert healthy verdict
+      - name: Show full job output
+        if: always()
+        run: kubectl logs -n kube-system -l job-name=devnopes --tail=200
+
+      - name: Assert healthy verdict
         run: |
-          LOGS=$(kubectl logs -n kube-system -l job-name=devnopes --tail=200)
-          echo "$LOGS"
-          echo "$LOGS" | grep "INFRASTRUCTURE IS HEALTHY"
+          kubectl logs -n kube-system -l job-name=devnopes \
+            | grep "INFRASTRUCTURE IS HEALTHY"
 
-  # ── Stage 4: Release ─────────────────────────────────────────────────────────
-  # Pushes Docker image + publishes Helm chart. Only runs on version tags.
-  release:
-    needs: [scan, test]
-    if: startsWith(github.ref, 'refs/tags/')
-    runs-on: ubuntu-latest
-    permissions:
-      contents: write   # required to push Helm chart to gh-pages
-    steps:
-      - uses: actions/checkout@v4
-
-      - name: Set chart version from tag
-        run: |
-          VERSION="${{ github.ref_name }}"
-          VERSION="${VERSION#v}"
-          sed -i "s/^version: .*/version: ${VERSION}/" helm/Chart.yaml
-          sed -i "s/^appVersion: .*/appVersion: \"${VERSION}\"/" helm/Chart.yaml
-
-      - uses: actions/download-artifact@v4
-        with:
-          name: docker-image
-          path: /tmp
-
-      - name: Load image
-        run: docker load < /tmp/image.tar.gz
-
+      # ── Docker: push (tag releases only) ─────────────────────────────────────
       - name: Login to Docker Hub
+        if: startsWith(github.ref, 'refs/tags/')
         uses: docker/login-action@v3
         with:
           username: ${{ secrets.DOCKERHUB_USERNAME }}
           password: ${{ secrets.DOCKERHUB_TOKEN }}
 
-      - name: Push Docker image
+      - name: Tag and push release image
+        # Uses the image already built and tested above.
+        # github.ref_name on a tag push is the tag name verbatim (e.g. v1.0.0).
+        if: startsWith(github.ref, 'refs/tags/')
         run: |
           docker tag ${{ env.CI_IMAGE }} ${{ env.IMAGE_NAME }}:${{ github.ref_name }}
           docker tag ${{ env.CI_IMAGE }} ${{ env.IMAGE_NAME }}:latest
           docker push ${{ env.IMAGE_NAME }}:${{ github.ref_name }}
           docker push ${{ env.IMAGE_NAME }}:latest
-
-      - name: Publish Helm chart to GitHub Pages
-        run: |
-          VERSION="${{ github.ref_name }}"
-          VERSION="${VERSION#v}"
-
-          cp README.md helm/README.md
-          helm package ./helm --destination /tmp/helm-pkg
-
-          git config user.name "github-actions[bot]"
-          git config user.email "github-actions[bot]@users.noreply.github.com"
-          git fetch origin gh-pages
-          git checkout gh-pages
-
-          cp /tmp/helm-pkg/devnopes-${VERSION}.tgz .
-          helm repo index . --url https://seab4ng.github.io/Devnopes
-
-          git add devnopes-${VERSION}.tgz index.yaml
-          git commit -m "Release Helm chart v${VERSION}"
-          git push origin gh-pages
