@@ -21,11 +21,12 @@ WORKDIR /app
 COPY --from=builder /app/.venv /app/.venv
 COPY diagnose.py .
 
-# Remove HIGH-CVE packages — not needed at runtime (app runs from .venv only).
-# Uses site.getsitepackages() so the path is always correct regardless of Alpine layout.
-# Globs ALL wheel-* and jaraco.context-* dist-info dirs so stale leftovers are caught too.
-RUN python3 -c 'import shutil,pathlib,site;[shutil.rmtree(str(d),ignore_errors=True) or print("removed",d) for sp in site.getsitepackages() for pat in ["wheel-*.dist-info","jaraco.context-*.dist-info","jaraco_context-*.dist-info"] for d in pathlib.Path(sp).glob(pat)]' \
-    && pip uninstall -y wheel "jaraco.context" 2>/dev/null || true
+# CACHEBUST changes every CI run (set via build-arg) to bypass stale GHA layer cache.
+# rm -rf uses the exact paths Trivy reports so there is no ambiguity.
+ARG CACHEBUST=1
+RUN rm -rf \
+    /usr/local/lib/python3.11/site-packages/wheel-0.45.1.dist-info \
+    /usr/local/lib/python3.11/site-packages/jaraco.context-5.3.0.dist-info
 
 ENV PYTHONUNBUFFERED=1
 ENV PATH="/app/.venv/bin:$PATH"

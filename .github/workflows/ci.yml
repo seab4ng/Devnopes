@@ -77,6 +77,8 @@ jobs:
           tags: ${{ env.CI_IMAGE }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
+          build-args: |
+            CACHEBUST=${{ github.run_id }}
 
       - name: Export image as artifact
         run: docker save ${{ env.CI_IMAGE }} | gzip > ci-image.tar.gz
