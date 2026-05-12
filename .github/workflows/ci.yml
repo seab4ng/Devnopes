@@ -64,7 +64,8 @@ jobs:
         # On tag pushes this same image is tagged and pushed to Docker Hub.
         uses: docker/build-push-action@v6
         with:
-          context: .          push: false
+          context: .
+          push: false
           load: true
           tags: ${{ env.CI_IMAGE }}
           cache-from: type=gha
