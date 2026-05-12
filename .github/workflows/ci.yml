@@ -15,29 +15,22 @@ on:
 # Required GitHub secrets:
 #   DOCKERHUB_USERNAME  — your Docker Hub username
 #   DOCKERHUB_TOKEN     — Docker Hub access token
-#                         (Docker Hub → Account Settings → Security → New Access Token)
-#
-# Image is pushed to:  <DOCKERHUB_USERNAME>/devnopes:<tag>  and  :latest
 
 env:
   IMAGE_NAME: ${{ secrets.DOCKERHUB_USERNAME }}/devnopes
   CI_IMAGE: devnopes:ci-test
 
 jobs:
-  build-test-push:
+
+  # ───────────────────────────────────────────────────────────────
+  # Stage 1 — verify Python dependencies
+  # ───────────────────────────────────────────────────────────────
+  verify:
+    name: Verify dependencies
     runs-on: ubuntu-latest
-    permissions:
-      contents: read
-      security-events: write   # required for SARIF upload to GitHub Security tab
-
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
 
-      # ── Python dependency management via uv ──────────────────────────────────
-      # uv is a fast Python package manager (written in Rust).
-      # It generates uv.lock (the lockfile) and installs from it.
-      # This step runs in CI — NOT inside the Docker container at runtime.
       - name: Install uv
         uses: astral-sh/setup-uv@v4
         with:
@@ -46,22 +39,36 @@ jobs:
           cache-dependency-glob: "uv.lock"
 
       - name: Generate / verify lockfile
-        # uv lock is idempotent: no-op if pyproject.toml hasn't changed.
-        # Generates uv.lock on first run; verifies it on subsequent runs.
         run: uv lock
 
-      - name: Install dependencies (CI verification)
-        # Installs exactly the versions pinned in uv.lock — no surprises.
-        # This also smoke-tests that the lockfile is valid.
+      - name: Install dependencies
         run: uv sync --frozen --no-dev
 
-      # ── Docker: build ────────────────────────────────────────────────────────
+
+  # ───────────────────────────────────────────────────────────────
+  # Stage 2 — build Docker image and export as artifact
+  # ───────────────────────────────────────────────────────────────
+  build:
+    name: Build image
+    needs: verify
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v4
+        with:
+          version: "0.5.4"
+          enable-cache: true
+          cache-dependency-glob: "uv.lock"
+
+      - name: Generate lockfile for Docker build context
+        run: uv lock
+
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
 
-      - name: Build image (load into local daemon)
-        # Always built and loaded locally — used by the integration test below.
-        # On tag pushes this same image is tagged and pushed to Docker Hub.
+      - name: Build image
         uses: docker/build-push-action@v6
         with:
           context: .
@@ -71,8 +78,37 @@ jobs:
           cache-from: type=gha
           cache-to: type=gha,mode=max
 
-      # ── Security scan ────────────────────────────────────────────────────────
-      - name: Scan image for vulnerabilities (Trivy)
+      - name: Export image as artifact
+        run: docker save ${{ env.CI_IMAGE }} | gzip > ci-image.tar.gz
+
+      - name: Upload image artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ci-image
+          path: ci-image.tar.gz
+          retention-days: 1
+
+
+  # ───────────────────────────────────────────────────────────────
+  # Stage 3 — security scan (runs in parallel with integration-test)
+  # ───────────────────────────────────────────────────────────────
+  scan:
+    name: Security scan (Trivy)
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      security-events: write
+    steps:
+      - name: Download image artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: ci-image
+
+      - name: Load image
+        run: docker load < ci-image.tar.gz
+
+      - name: Scan for vulnerabilities
         uses: aquasecurity/trivy-action@master
         with:
           image-ref: ${{ env.CI_IMAGE }}
@@ -82,13 +118,31 @@ jobs:
           ignore-unfixed: true
           exit-code: "0"   # report only — do not fail the build
 
-      - name: Upload scan results to GitHub Security tab
+      - name: Upload results to GitHub Security tab
         uses: github/codeql-action/upload-sarif@v3
         if: always()
         with:
           sarif_file: trivy-results.sarif
 
-      # ── Integration test ─────────────────────────────────────────────────────
+
+  # ───────────────────────────────────────────────────────────────
+  # Stage 4 — integration test (runs in parallel with scan)
+  # ───────────────────────────────────────────────────────────────
+  integration-test:
+    name: Integration test (kind)
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download image artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: ci-image
+
+      - name: Load image
+        run: docker load < ci-image.tar.gz
+
       - name: Create kind cluster
         uses: helm/kind-action@v1
         with:
@@ -104,9 +158,8 @@ jobs:
         run: kind load docker-image ${{ env.CI_IMAGE }}
 
       - name: Install devnopes via Helm
-        # pullPolicy=Never — image was loaded locally above, do not pull from registry.
-        # cniConfMount.enabled=false — kind nodes are containers; no real /etc/cni/net.d.
-        #   The tool falls back to CRD/pod detection automatically.
+        # pullPolicy=Never — image loaded locally, not pulled from registry
+        # cniConfMount.enabled=false — kind nodes are containers, no real /etc/cni/net.d
         run: |
           helm install devnopes ./helm \
             -n kube-system \
@@ -131,18 +184,33 @@ jobs:
           kubectl logs -n kube-system -l job-name=devnopes \
             | grep "INFRASTRUCTURE IS HEALTHY"
 
-      # ── Docker: push (tag releases only) ─────────────────────────────────────
+
+  # ───────────────────────────────────────────────────────────────
+  # Stage 5 — push to Docker Hub (tag releases only)
+  # Both scan and integration-test must pass before push.
+  # ───────────────────────────────────────────────────────────────
+  push:
+    name: Push to Docker Hub
+    needs: [scan, integration-test]
+    if: startsWith(github.ref, 'refs/tags/')
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download image artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: ci-image
+
+      - name: Load image
+        run: docker load < ci-image.tar.gz
+
       - name: Login to Docker Hub
-        if: startsWith(github.ref, 'refs/tags/')
         uses: docker/login-action@v3
         with:
           username: ${{ secrets.DOCKERHUB_USERNAME }}
           password: ${{ secrets.DOCKERHUB_TOKEN }}
 
       - name: Tag and push release image
-        # Uses the image already built and tested above.
-        # github.ref_name on a tag push is the tag name verbatim (e.g. v1.0.0).
-        if: startsWith(github.ref, 'refs/tags/')
+        # github.ref_name on a tag push is the tag verbatim (e.g. v1.0.0)
         run: |
           docker tag ${{ env.CI_IMAGE }} ${{ env.IMAGE_NAME }}:${{ github.ref_name }}
           docker tag ${{ env.CI_IMAGE }} ${{ env.IMAGE_NAME }}:latest
