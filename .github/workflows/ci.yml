@@ -30,7 +30,7 @@ jobs:
     runs-on: ubuntu-latest
 
     permissions:
-      contents: read
+      contents: write          # required to push Helm chart to gh-pages
       security-events: write   # required to upload Trivy SARIF to GitHub Security tab
 
     steps:
@@ -162,3 +162,28 @@ jobs:
           docker tag ${{ env.CI_IMAGE }} ${{ env.IMAGE_NAME }}:latest
           docker push ${{ env.IMAGE_NAME }}:${{ github.ref_name }}
           docker push ${{ env.IMAGE_NAME }}:latest
+
+      # ── Helm chart: publish to GitHub Pages ──────────────────────────────────────────
+      - name: Publish Helm chart to GitHub Pages
+        # Packages the chart and updates the Helm repo index on the gh-pages branch.
+        # Chart.yaml version was already set by "Set chart version from tag" above.
+        if: startsWith(github.ref, 'refs/tags/')
+        run: |
+          VERSION="${{ github.ref_name }}"
+          VERSION="${VERSION#v}"
+
+          # Package the chart
+          helm package ./helm --destination /tmp/helm-pkg
+
+          # Switch to gh-pages and update the repo
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git fetch origin gh-pages
+          git checkout gh-pages
+
+          cp /tmp/helm-pkg/devnopes-${VERSION}.tgz .
+          helm repo index . --url https://seab4ng.github.io/Devnopes
+
+          git add devnopes-${VERSION}.tgz index.yaml
+          git commit -m "Release Helm chart v${VERSION}"
+          git push origin gh-pages
