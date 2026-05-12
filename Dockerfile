@@ -21,10 +21,12 @@ WORKDIR /app
 COPY --from=builder /app/.venv /app/.venv
 COPY diagnose.py .
 
-# Upgrade system-Python packages with known HIGH CVEs.
-# Our app runs from .venv; these system packages are not used at runtime
-# but Trivy scans them. Pinning to patched versions eliminates the findings.
-RUN pip install --no-cache-dir --force-reinstall "wheel>=0.47.0" "jaraco.context>=6.0.0"
+# Remove HIGH-CVE packages from system Python — not used at runtime (app runs from .venv).
+# pip uninstall removes files+dist-info; the find is a fallback in case pip leaves stragglers.
+RUN pip uninstall -y wheel "jaraco.context" 2>/dev/null || true \
+    && find /usr/local/lib/python3.11/site-packages -maxdepth 1 -type d \
+         \( -name "wheel-*.dist-info" -o -name "jaraco.context-*.dist-info" \) \
+         -exec rm -rf {} +
 
 ENV PYTHONUNBUFFERED=1
 ENV PATH="/app/.venv/bin:$PATH"
