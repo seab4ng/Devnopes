@@ -1,12 +1,12 @@
-# ── Image ─────────────────────────────────────────────────────────────────────
+# ── Image ─────────────────────────────────────────────────────────────────────────────────
 image:
   # In airgap environments, replace with your internal registry:
   #   repository: registry.internal.corp/tools/devnopes
-  repository: your-dockerhub-username/devnopes
+  repository: sokushinbutsu/devnopes
   tag: latest
   pullPolicy: IfNotPresent
 
-# ── Core cluster config ────────────────────────────────────────────────────────
+# ── Core cluster config ──────────────────────────────────────────────────────────────
 config:
   # DNS domain of the cluster. Change if your cluster uses a custom domain.
   clusterDomain: cluster.local
@@ -25,7 +25,7 @@ config:
   # Default: 300 = last 5 minutes.
   logScanSeconds: "300"
 
-# ── Optional: service network path test ───────────────────────────────────────
+# ── Optional: service network path test ───────────────────────────────────────────
 # When enabled, the tool runs a 4-step test on a specific service:
 #   Step 1 — DNS resolution timing
 #   Step 2 — Ground-truth ClusterIP from K8s API
@@ -38,7 +38,7 @@ networkPathTest:
   namespace: default # namespace the service lives in
   port: 80           # port to TCP-probe
 
-# ── CNI config mount ──────────────────────────────────────────────────────────
+# ── CNI config mount ───────────────────────────────────────────────────────────────────
 # Mounts /etc/cni/net.d from the host node so the tool can read the CNI config
 # file directly — the most reliable way to identify which CNI is installed.
 # Disable if your security policy prohibits hostPath volumes; the tool will
@@ -47,7 +47,7 @@ cniConfMount:
   enabled: true
   hostPath: /etc/cni/net.d
 
-# ── Job settings ──────────────────────────────────────────────────────────────
+# ── Job settings ────────────────────────────────────────────────────────────────────
 job:
   # Namespace to run the Job in. kube-system is recommended so the Job can
   # easily reach all cluster components.
@@ -67,7 +67,7 @@ job:
       operator: Exists
       effect: NoSchedule
 
-# ── Resource limits ───────────────────────────────────────────────────────────
+# ── Resource limits ───────────────────────────────────────────────────────────────────
 resources:
   requests:
     cpu: 50m

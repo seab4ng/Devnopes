@@ -19,7 +19,7 @@ on:
 #   DOCKERHUB_TOKEN     — Docker Hub access token
 
 env:
-  IMAGE_NAME: ${{ secrets.DOCKERHUB_USERNAME }}/devnopes
+  IMAGE_NAME: sokushinbutsu/devnopes
   CI_IMAGE: devnopes:ci-test
 
 jobs:
