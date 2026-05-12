@@ -62,8 +62,8 @@ The image is built in CI (which has internet) and pushed to Docker Hub. In airga
 
 ```bash
 # On a machine with internet access:
-docker pull your-dockerhub-username/devnopes:latest
-docker tag  your-dockerhub-username/devnopes:latest \
+docker pull sokushinbutsu/devnopes:latest
+docker tag  sokushinbutsu/devnopes:latest \
             registry.internal.corp/tools/devnopes:latest
 docker push registry.internal.corp/tools/devnopes:latest
 ```
@@ -205,7 +205,7 @@ Go to **Settings → Secrets and variables → Actions → New repository secret
 | `DOCKERHUB_USERNAME` | Your Docker Hub username |
 | `DOCKERHUB_TOKEN` | Docker Hub → Account Settings → Security → New Access Token |
 
-The image is pushed to `<DOCKERHUB_USERNAME>/devnopes`.
+The image is pushed to `sokushinbutsu/devnopes`.
 
 ### Image tags produced
 
