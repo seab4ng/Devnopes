@@ -172,6 +172,9 @@ jobs:
           VERSION="${{ github.ref_name }}"
           VERSION="${VERSION#v}"
 
+          # Copy root README into the chart so ArtifactHub displays it
+          cp README.md helm/README.md
+
           # Package the chart
           helm package ./helm --destination /tmp/helm-pkg
 
