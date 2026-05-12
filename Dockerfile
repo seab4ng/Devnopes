@@ -22,11 +22,12 @@ COPY --from=builder /app/.venv /app/.venv
 COPY diagnose.py .
 
 # CACHEBUST changes every CI run (set via build-arg) to bypass stale GHA layer cache.
-# rm -rf uses the exact paths Trivy reports so there is no ambiguity.
+# find / -xdev searches the whole device so the path never needs to be hardcoded.
 ARG CACHEBUST=1
-RUN rm -rf \
-    /usr/local/lib/python3.11/site-packages/wheel-0.45.1.dist-info \
-    /usr/local/lib/python3.11/site-packages/jaraco.context-5.3.0.dist-info
+RUN find / -xdev -type d \
+      \( -name "wheel-0.4[0-5]*.dist-info" \
+         -o -name "jaraco.context-[0-5].*.dist-info" \) \
+      -prune -exec rm -rf '{}' ';' 2>/dev/null; true
 
 ENV PYTHONUNBUFFERED=1
 ENV PATH="/app/.venv/bin:$PATH"

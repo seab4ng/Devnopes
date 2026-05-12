@@ -1,0 +1,4 @@
+# wheel and jaraco.context are pip's own tooling deps.
+# Our app runs exclusively from .venv and never invokes these packages at runtime.
+CVE-2026-24049
+CVE-2026-23949
