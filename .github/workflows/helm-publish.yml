@@ -1,0 +1,51 @@
+name: Release Helm chart
+
+on:
+  push:
+    tags:
+      - "v*"
+
+jobs:
+  helm-publish:
+    name: Package and publish Helm chart
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write   # needed to push to gh-pages
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Install Helm
+        uses: azure/setup-helm@v4
+
+      - name: Update chart version to match tag
+        run: |
+          VERSION="${GITHUB_REF_NAME#v}"
+          sed -i "s/^version:.*/version: $VERSION/" helm/Chart.yaml
+          sed -i "s/^appVersion:.*/appVersion: \"$VERSION\"/" helm/Chart.yaml
+
+      - name: Package chart
+        run: helm package helm/ --destination .cr-release-packages/
+
+      - name: Checkout gh-pages
+        uses: actions/checkout@v4
+        with:
+          ref: gh-pages
+          path: gh-pages
+
+      - name: Update Helm repo index
+        run: |
+          cp .cr-release-packages/*.tgz gh-pages/
+          helm repo index gh-pages/ \
+            --url https://seab4ng.github.io/Devnopes/ \
+            --merge gh-pages/index.yaml
+
+      - name: Push gh-pages
+        run: |
+          cd gh-pages
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add .
+          git commit -m "Release Helm chart ${{ github.ref_name }}"
+          git push
